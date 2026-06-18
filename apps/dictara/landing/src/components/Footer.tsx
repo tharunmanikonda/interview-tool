@@ -1,0 +1,60 @@
+import { Github } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { useDownload } from "@/hooks/useDownload";
+
+export function Footer() {
+  const currentYear = new Date().getFullYear();
+  const { version } = useDownload();
+
+  return (
+    <footer className="relative py-12 border-t border-white/5">
+      <div className="max-w-6xl mx-auto px-6">
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-6">
+          {/* Logo and copyright */}
+          <div className="flex flex-col items-center sm:items-start gap-2">
+            <span className="text-xl font-bold text-gradient-cool">
+              Dictara
+            </span>
+            <p className="text-sm text-white/40">
+              &copy; {currentYear} Dictara{version ? ` ${version}` : ""}. Open
+              source under MIT.
+            </p>
+          </div>
+
+          {/* Links */}
+          <div className="flex flex-wrap items-center justify-center gap-6">
+            <a
+              href="https://github.com/vitalii-zinchenko/dictara"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-2 text-white/60 hover:text-white transition-colors"
+            >
+              <Github className="w-5 h-5" />
+              <span className="text-sm">GitHub</span>
+            </a>
+            <a
+              href="https://github.com/vitalii-zinchenko/dictara/releases"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-white/60 hover:text-white transition-colors"
+            >
+              Releases
+            </a>
+            <Link
+              to="/privacy"
+              className="text-sm text-white/60 hover:text-white transition-colors"
+            >
+              Privacy
+            </Link>
+            <Link
+              to="/terms"
+              className="text-sm text-white/60 hover:text-white transition-colors"
+            >
+              Terms
+            </Link>
+          </div>
+        </div>
+      </div>
+    </footer>
+  );
+}

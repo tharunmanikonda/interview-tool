@@ -1,0 +1,41 @@
+# Rust build artifacts
+target/
+
+# Logs
+logs
+.logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+ai-context
+audio
+
+# Environment variables (contains secrets!)
+.env
+
+# TanStack Router generated files
+# Note: routeTree.gen.ts is now committed for CI builds
+# src/routeTree.gen.ts
+.tanstack/tmp/
+
+ai-context

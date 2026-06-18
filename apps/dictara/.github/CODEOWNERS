@@ -1,0 +1,17 @@
+# Code Owners for Dictara
+# These owners will be requested for review when someone opens a pull request.
+
+# Default owner for everything
+* @vitalii-zinchenko
+
+# Frontend (React/TypeScript)
+/src/ @vitalii-zinchenko
+
+# Rust/Tauri backend
+/src-tauri/ @vitalii-zinchenko
+
+# GitHub configuration
+/.github/ @vitalii-zinchenko
+
+# Landing page
+/landing/ @vitalii-zinchenko

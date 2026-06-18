@@ -1,0 +1,5 @@
+packages:
+  - "apps/extension"
+  - "apps/native-helper"
+  - "apps/dictara"
+  - "packages/*"

@@ -1,0 +1,11 @@
+<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Sound waves -->
+  <path d="M2 12h2" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+  <path d="M5.5 7v10" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+  <path d="M9 3v18" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+  <path d="M12.5 6v12" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+  <path d="M16 9v6" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+  <!-- AI sparkles -->
+  <path d="M20 3l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7.7-2z" fill="white" />
+  <path d="M19.5 14l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5 1.5-.5.5-1.5z" fill="white" opacity="0.7" />
+</svg>

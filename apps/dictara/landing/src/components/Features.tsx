@@ -1,0 +1,107 @@
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  IconLightning,
+  IconLanguages,
+  IconPrivacy,
+  IconWhisper,
+  IconWorkflow,
+  IconAutoPaste,
+} from "@/components/icons/FeatureIcons";
+
+const features = [
+  {
+    icon: IconLightning,
+    title: "Lightning Fast",
+    description:
+      "Get your transcriptions in seconds. No waiting, no loading screens—just instant results.",
+    gradient: "from-warm-golden to-warm-orange",
+  },
+  {
+    icon: IconLanguages,
+    title: "90+ Languages",
+    description:
+      "Speak in your native language. Whisper understands and transcribes over 90 languages accurately.",
+    gradient: "from-cool-cyan to-cool-blue",
+  },
+  {
+    icon: IconPrivacy,
+    title: "Privacy First",
+    description:
+      "Your audio is recorded locally first. API keys stored securely in your system keychain.",
+    gradient: "from-cool-purple to-cool-blue",
+  },
+  {
+    icon: IconWhisper,
+    title: "Powered by Whisper",
+    description:
+      "Leveraging OpenAI's state-of-the-art Whisper model for industry-leading accuracy.",
+    gradient: "from-warm-coral to-warm-orange",
+  },
+  {
+    icon: IconWorkflow,
+    title: "Simple Workflow",
+    description:
+      "Hold FN to record, release to transcribe. Or press FN+Space for hands-free dictation.",
+    gradient: "from-cool-blue to-cool-cyan",
+  },
+  {
+    icon: IconAutoPaste,
+    title: "Auto Paste",
+    description:
+      "Transcribed text is automatically pasted wherever your cursor is. No extra steps needed.",
+    gradient: "from-warm-orange to-warm-golden",
+  },
+];
+
+export function Features() {
+  return (
+    <section id="features" className="relative py-24 sm:py-32">
+      {/* Background accents */}
+      <div className="absolute inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-0 left-1/4 w-96 h-96 bg-radial-purple-soft blur-3xl" />
+        <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-radial-coral-soft blur-3xl" />
+      </div>
+
+      <div className="relative z-10 max-w-6xl mx-auto px-6">
+        {/* Section header */}
+        <div className="text-center mb-16">
+          <h2 className="text-3xl sm:text-4xl md:text-5xl font-bold mb-4">
+            Everything you need to{" "}
+            <span className="text-gradient-warm">dictate</span>
+          </h2>
+          <p className="text-lg text-white/60 max-w-2xl mx-auto">
+            A minimal, focused tool that does one thing exceptionally well—turns
+            your voice into text.
+          </p>
+        </div>
+
+        {/* Features grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {features.map((feature, index) => (
+            <Card
+              key={index}
+              className="group hover:border-white/20 transition-all duration-300 hover:-translate-y-1"
+            >
+              <CardContent className="p-6">
+                {/* Icon */}
+                <div
+                  className={`inline-flex items-center justify-center w-12 h-12 rounded-xl bg-linear-to-br ${feature.gradient} mb-4 group-hover:scale-110 transition-transform duration-300`}
+                >
+                  <feature.icon className="w-6 h-6 text-white" />
+                </div>
+
+                {/* Title */}
+                <h3 className="text-lg font-semibold mb-2">{feature.title}</h3>
+
+                {/* Description */}
+                <p className="text-white/60 text-sm leading-relaxed">
+                  {feature.description}
+                </p>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}

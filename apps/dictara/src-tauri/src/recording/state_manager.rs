@@ -1,0 +1,236 @@
+//! Recording State Machine - Single source of truth for valid state transitions
+//!
+//! State diagram:
+//! ```text
+//! Ready ──Start──> Recording ──Stop──> Transcribing ──reset()──> Ready
+//!   │                   │
+//! [Retry]            [Lock]
+//!   │                   ↓
+//!   │          RecordingLocked
+//!   │                   │
+//!   │               [Start]──> Transcribing (Fn pressed again to stop)
+//!   │               [Cancel]──> Ready
+//!   └──────────────────────────> Transcribing
+//! ```
+//!
+//! Note: Transcribing state exits via reset() - no dedicated events needed
+//! since both success and failure return to Ready state.
+
+use std::sync::Mutex;
+
+/// Events that can trigger state transitions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub enum RecordingEvent {
+    /// Start recording
+    Start,
+    /// Stop recording and transcribe
+    Stop,
+    /// Stop/transcribe the current chunk and continue recording for rolling capture
+    RollingRestart,
+    /// Stop/transcribe the current chunk and mark it as the final rolling chunk
+    RollingFinalize,
+    /// Lock recording (Fn release will be ignored)
+    Lock,
+    /// Escape or cancel action
+    Cancel,
+    /// Retry transcription with existing audio file
+    Retry,
+}
+
+/// Actions the Controller should perform after a state transition
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingAction {
+    /// Start a new recording session
+    StartRecording,
+    /// Stop recording and begin transcription
+    StopAndTranscribe,
+    /// Stop recording, transcribe, paste, and begin another locked recording
+    StopTranscribeAndRestart,
+    /// Stop recording, transcribe, paste, and append the Live Assist finalize marker
+    StopTranscribeAndFinalize,
+    /// Cancel recording without transcription
+    CancelRecording,
+    /// Retry transcription with existing audio file
+    RetryTranscription,
+}
+
+/// Recording states
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub enum RecordingState {
+    /// Controller is ready to start recording
+    Ready,
+    /// Controller is currently recording
+    Recording,
+    /// Recording is locked - Fn release will be ignored
+    RecordingLocked,
+    /// Audio is being transcribed
+    Transcribing,
+}
+
+impl RecordingState {
+    /// Check if the app is busy (recording, locked, or transcribing)
+    pub fn is_busy(self) -> bool {
+        self != Self::Ready
+    }
+}
+
+/// Result of a successful state transition
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionResult {
+    /// State changed
+    Changed {
+        from: RecordingState,
+        to: RecordingState,
+        action: Option<RecordingAction>,
+    },
+    /// Event was valid but state didn't change
+    Unchanged,
+}
+
+/// Reason a transition was rejected
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{attempted_event} event rejected in {current_state} state")]
+pub struct TransitionRejection {
+    pub current_state: RecordingState,
+    pub attempted_event: RecordingEvent,
+}
+
+/// Thread-safe recording state manager
+#[derive(Debug)]
+pub struct RecordingStateManager {
+    state: Mutex<RecordingState>,
+}
+
+impl RecordingStateManager {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(RecordingState::Ready),
+        }
+    }
+
+    /// Get the current state (read-only, thread-safe)
+    pub fn current(&self) -> RecordingState {
+        *self.state.lock().unwrap()
+    }
+
+    /// Check if the app is busy (recording or locked)
+    pub fn is_busy(&self) -> bool {
+        self.current().is_busy()
+    }
+
+    /// Check if currently in Recording state (not locked)
+    /// Used to determine when to swallow the Space key for lock transition
+    #[allow(dead_code)]
+    pub fn is_recording(&self) -> bool {
+        self.current() == RecordingState::Recording
+    }
+
+    /// Check if currently in RecordingLocked state (hands-free mode)
+    /// Used to ignore keyboard trigger release in locked mode
+    pub fn is_recording_locked(&self) -> bool {
+        self.current() == RecordingState::RecordingLocked
+    }
+
+    /// Attempt a state transition based on an event
+    ///
+    /// This is the ONLY way to change state - ensures all transitions are valid.
+    pub fn transition(
+        &self,
+        event: RecordingEvent,
+    ) -> Result<TransitionResult, TransitionRejection> {
+        let mut state = self.state.lock().unwrap();
+        let current = *state;
+
+        match self.compute_transition(current, event) {
+            Some((new_state, action)) => {
+                if new_state == current {
+                    return Ok(TransitionResult::Unchanged);
+                }
+
+                *state = new_state;
+                Ok(TransitionResult::Changed {
+                    from: current,
+                    to: new_state,
+                    action,
+                })
+            }
+            None => Err(TransitionRejection {
+                current_state: current,
+                attempted_event: event,
+            }),
+        }
+    }
+
+    /// Pure function: compute what transition should happen (if any)
+    /// Returns None if the transition is invalid
+    fn compute_transition(
+        &self,
+        current: RecordingState,
+        event: RecordingEvent,
+    ) -> Option<(RecordingState, Option<RecordingAction>)> {
+        match current {
+            RecordingState::Ready => match event {
+                RecordingEvent::Start => Some((
+                    RecordingState::Recording,
+                    Some(RecordingAction::StartRecording),
+                )),
+                RecordingEvent::Retry => Some((
+                    RecordingState::Transcribing,
+                    Some(RecordingAction::RetryTranscription),
+                )),
+                _ => None,
+            },
+
+            RecordingState::Recording => match event {
+                RecordingEvent::Stop => Some((
+                    RecordingState::Transcribing,
+                    Some(RecordingAction::StopAndTranscribe),
+                )),
+                RecordingEvent::Lock => Some((RecordingState::RecordingLocked, None)),
+                RecordingEvent::Cancel => Some((
+                    RecordingState::Ready,
+                    Some(RecordingAction::CancelRecording),
+                )),
+                _ => None,
+            },
+
+            RecordingState::RecordingLocked => match event {
+                // Fn pressed again while locked = stop recording
+                RecordingEvent::Start | RecordingEvent::Stop => Some((
+                    RecordingState::Transcribing,
+                    Some(RecordingAction::StopAndTranscribe),
+                )),
+                RecordingEvent::RollingRestart => Some((
+                    RecordingState::Transcribing,
+                    Some(RecordingAction::StopTranscribeAndRestart),
+                )),
+                RecordingEvent::RollingFinalize => Some((
+                    RecordingState::Transcribing,
+                    Some(RecordingAction::StopTranscribeAndFinalize),
+                )),
+                RecordingEvent::Cancel => Some((
+                    RecordingState::Ready,
+                    Some(RecordingAction::CancelRecording),
+                )),
+                _ => None,
+            },
+
+            // Transcribing state exits via reset() - no events trigger transitions
+            RecordingState::Transcribing => None,
+        }
+    }
+
+    /// Reset to Ready state
+    ///
+    /// Used to exit Transcribing state (both success and failure)
+    /// and for error recovery in other states.
+    pub fn reset(&self) {
+        *self.state.lock().unwrap() = RecordingState::Ready;
+    }
+}
+
+impl Default for RecordingStateManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -1,0 +1,13 @@
+/* Only apply transparent background to recording-popup window */
+:root[data-window-path="recording-popup"] {
+  background-color: transparent !important;
+}
+
+[data-window-path="recording-popup"] body,
+[data-window-path="recording-popup"] html,
+[data-window-path="recording-popup"] #root {
+  margin: 0;
+  padding: 0;
+  background-color: transparent !important;
+  overflow: hidden;
+}

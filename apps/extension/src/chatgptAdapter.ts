@@ -122,6 +122,15 @@ export class ChatGptAdapter {
     };
   }
 
+  scrollConversationToRatio(ratio: number) {
+    const scroller = this.findConversationScroller();
+    if (!scroller) return false;
+
+    const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    scroller.scrollTop = clamp(ratio, 0, 1) * maxScrollTop;
+    return true;
+  }
+
   private findComposer() {
     const candidates = composerSelectors.flatMap((selector) => Array.from(document.querySelectorAll<HTMLElement>(selector)));
     return candidates
@@ -172,6 +181,27 @@ export class ChatGptAdapter {
       visible.push(message);
     }
     return visible;
+  }
+
+  private findConversationScroller() {
+    const messageNodes = Array.from(document.querySelectorAll<HTMLElement>("[data-message-author-role]")).filter(
+      (element) => isVisible(element) && !isInsideExtension(element)
+    );
+
+    const candidates = new Set<HTMLElement>();
+    for (const message of messageNodes) {
+      let node: HTMLElement | null = message;
+      while (node && node !== document.body) {
+        if (isScrollable(node) && !isInsideExtension(node)) candidates.add(node);
+        node = node.parentElement;
+      }
+    }
+
+    const best = [...candidates].sort((a, b) => scoreScroller(b, messageNodes) - scoreScroller(a, messageNodes))[0];
+    if (best) return best;
+
+    const documentScroller = document.scrollingElement instanceof HTMLElement ? document.scrollingElement : document.documentElement;
+    return documentScroller.scrollHeight > documentScroller.clientHeight ? documentScroller : null;
   }
 }
 
@@ -297,6 +327,24 @@ function isVisible(element: HTMLElement) {
   const rect = element.getBoundingClientRect();
   const style = window.getComputedStyle(element);
   return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+}
+
+function isScrollable(element: HTMLElement) {
+  const style = window.getComputedStyle(element);
+  const canScrollY = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`);
+  return canScrollY && element.scrollHeight - element.clientHeight > 24;
+}
+
+function scoreScroller(element: HTMLElement, messages: HTMLElement[]) {
+  const messageCount = messages.filter((message) => element.contains(message)).length;
+  const scrollCapacity = Math.max(0, element.scrollHeight - element.clientHeight);
+  const rect = element.getBoundingClientRect();
+  const viewportFit = rect.height > window.innerHeight * 0.45 ? 1000 : 0;
+  return messageCount * 10000 + viewportFit + scrollCapacity;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function wait(ms: number) {

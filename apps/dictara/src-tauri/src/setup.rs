@@ -8,6 +8,7 @@ use crate::{
     globe_key,
     keyboard_listener::KeyListener,
     keychain::{self, ProviderAccount},
+    live_assist_bridge,
     models::{ModelLoader, ModelManager},
     recording::{
         cleanup_old_recordings, Controller, LastRecording, LastRecordingState, RecordingCommand,
@@ -33,6 +34,7 @@ pub struct AudioLevelChannel {
 
 pub fn setup_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), Box<dyn std::error::Error>> {
     info!("Dictara v{}", env!("CARGO_PKG_VERSION"));
+    live_assist_bridge::start();
 
     // Setup Specta for type-safe TypeScript bindings and event emission
     specta::setup(app.handle());

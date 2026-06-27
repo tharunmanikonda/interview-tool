@@ -6,6 +6,7 @@ mod error;
 mod globe_key;
 mod keyboard_listener;
 mod keychain;
+mod live_assist_bridge;
 mod log;
 mod models;
 mod recording;

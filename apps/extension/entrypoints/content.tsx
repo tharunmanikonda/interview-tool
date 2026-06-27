@@ -195,6 +195,7 @@ function LiveAssistOverlay() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const captureTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const docScrollRef = useRef<HTMLElement | null>(null);
+  const chatGptScrollRafRef = useRef<number | undefined>(undefined);
   const flowDebounceRef = useRef<number | undefined>(undefined);
   const focusIntervalRef = useRef<number | undefined>(undefined);
   const lastFlowSubmittedRef = useRef("");
@@ -232,6 +233,15 @@ function LiveAssistOverlay() {
 
   function latestAssistantText() {
     return adapter.readConversation().filter((turn) => turn.role === "assistant").at(-1)?.text || "";
+  }
+
+  function syncChatGptScrollFromDocument() {
+    const scroll = docScrollRef.current;
+    if (!scroll) return;
+
+    const maxScrollTop = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
+    const ratio = maxScrollTop > 0 ? scroll.scrollTop / maxScrollTop : 0;
+    adapter.scrollConversationToRatio(ratio);
   }
 
   useEffect(() => {
@@ -376,14 +386,37 @@ function LiveAssistOverlay() {
   }, [state.turns.length]);
 
   useEffect(() => {
+    const scroll = docScrollRef.current;
+    if (!scroll) return;
+
+    const handleScroll = () => {
+      if (chatGptScrollRafRef.current) window.cancelAnimationFrame(chatGptScrollRafRef.current);
+      chatGptScrollRafRef.current = window.requestAnimationFrame(() => {
+        chatGptScrollRafRef.current = undefined;
+        syncChatGptScrollFromDocument();
+      });
+    };
+
+    scroll.addEventListener("scroll", handleScroll, { passive: true });
+    syncChatGptScrollFromDocument();
+
+    return () => {
+      scroll.removeEventListener("scroll", handleScroll);
+      if (chatGptScrollRafRef.current) window.cancelAnimationFrame(chatGptScrollRafRef.current);
+    };
+  }, [adapter, isOpen]);
+
+  useEffect(() => {
     return () => {
       if (flowDebounceRef.current) window.clearTimeout(flowDebounceRef.current);
       if (answerStableTimerRef.current) window.clearTimeout(answerStableTimerRef.current);
+      if (chatGptScrollRafRef.current) window.cancelAnimationFrame(chatGptScrollRafRef.current);
     };
   }, []);
 
   useEffect(() => {
     if (!isVoiceCapture) return;
+    if (nativeStatusRef.current !== "disconnected" && nativeStatusRef.current !== "error") return;
 
     const focusTimer = window.setTimeout(() => {
       captureTextareaRef.current?.focus();
@@ -414,16 +447,27 @@ function LiveAssistOverlay() {
     const next = !isVoiceCapture;
     setIsVoiceCapture(next);
     setTypedRole("interviewer");
-    setStatusText(next ? "Dictara Capture ready. Start Dictara rolling mode and keep this cursor focused." : "Dictara Capture stopped");
-    debug(next ? "Dictara Capture enabled; focusing capture box" : "Dictara Capture disabled");
+    setStatusText(next ? "Dictara direct bridge ready. Start Dictara rolling mode." : "Dictara Capture stopped");
+    debug(next ? "Dictara direct bridge enabled" : "Dictara Capture disabled");
 
     if (next) {
-      window.setTimeout(() => {
-        const textarea = captureTextareaRef.current;
-        textarea?.focus();
-        const end = textarea?.value.length || 0;
-        textarea?.setSelectionRange(end, end);
-      }, 80);
+      nativeBridge.connect({
+        onStatus: (status, message) => {
+          nativeStatusRef.current = status;
+          setNativeStatus(status);
+          if (message) setStatusText(message);
+        },
+        onEvent: handleNativeEvent
+      });
+
+      if (nativeStatusRef.current === "disconnected" || nativeStatusRef.current === "error") {
+        window.setTimeout(() => {
+          const textarea = captureTextareaRef.current;
+          textarea?.focus();
+          const end = textarea?.value.length || 0;
+          textarea?.setSelectionRange(end, end);
+        }, 80);
+      }
     }
   }
 
@@ -460,7 +504,12 @@ function LiveAssistOverlay() {
       nativeStatusRef.current = "capturing";
       setRollingQuestion((current) => {
         const next = event.type === "chunk_transcribed" ? appendTranscriptChunk(current, event) : { ...current, starter: event.starter || current.starter };
-        if (next.buffer) engine.ingestPartial("interviewer", next.buffer, starterMode);
+        if (next.buffer) {
+          engine.ingestPartial("interviewer", next.buffer, starterMode);
+          if (event.type === "chunk_transcribed") {
+            void maybeSendStarterToChatGpt(next.buffer);
+          }
+        }
         return next;
       });
 
@@ -929,8 +978,8 @@ function LiveAssistOverlay() {
         <aside className="gptd-input-panel" aria-label="Typed transcript">
           <div className="gptd-panel-title">Live notes</div>
           <div className={isVoiceCapture ? "gptd-voice-hint active" : "gptd-voice-hint"}>
-            <strong>Dictara rolling paste</strong>
-            <span>{isVoiceCapture ? "Cursor is locked here. Press Fn+Space again to send the final chunk." : "Click Dictara Capture, then press Fn+Space."}</span>
+            <strong>Dictara direct bridge</strong>
+            <span>{isVoiceCapture ? "Speak in Dictara. Chunks stream here automatically." : "Click Dictara Capture, then press Fn+Space."}</span>
           </div>
           <div className={nativeStatus === "capturing" || nativeStatus === "transcribing" ? "gptd-native-card active" : "gptd-native-card"}>
             <strong>Native helper</strong>
@@ -954,9 +1003,9 @@ function LiveAssistOverlay() {
             value={typedText}
             onChange={(event) => handleCaptureTextChange(event.target.value)}
             onFocus={() => {
-              if (isVoiceCapture) debug("Voice capture box focused");
+              if (isVoiceCapture) debug("Fallback capture box focused");
             }}
-            placeholder={isVoiceCapture ? "Dictara chunks paste here. Press Fn+Space again when the question is complete..." : "Type notes or a follow-up question..."}
+            placeholder={isVoiceCapture ? "Fallback paste/typed input. Direct Dictara chunks appear above automatically..." : "Type notes or a follow-up question..."}
             onKeyDown={(event) => {
               if (event.altKey && event.key === "Enter") {
                 event.preventDefault();

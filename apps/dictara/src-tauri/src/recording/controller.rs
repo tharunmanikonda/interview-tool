@@ -5,6 +5,7 @@ use tauri_specta::Event;
 use tokio::sync::mpsc::Receiver;
 
 use crate::clients::{Transcriber, TranscriptionError};
+use crate::live_assist_bridge;
 use crate::recording::{
     audio_recorder::{cleanup_recording_file, AudioRecorder},
     commands::RecordingCommand,
@@ -171,6 +172,7 @@ impl Controller {
             error.error_type,
             error.error_message
         );
+        live_assist_bridge::transcription_error(&error.user_message);
 
         // Reset state machine to Ready
         self.state_manager.reset();
@@ -263,6 +265,7 @@ impl Controller {
                 if let Some(rec) = recording.take() {
                     self.handle_cancel(rec)?;
                 }
+                live_assist_bridge::capture_stopped();
                 // Notify updater that recording was cancelled
                 updater::on_recording_finished(&self.app_handle);
             }
@@ -276,6 +279,8 @@ impl Controller {
     }
 
     fn handle_start(&self) -> Result<Recording, ActionError> {
+        live_assist_bridge::capture_started();
+
         // Show recording popup window
         if let Err(e) = open_recording_popup(&self.app_handle) {
             log::error!("Failed to open recording popup: {}", e);
@@ -454,6 +459,13 @@ impl Controller {
         // Clean up recording file after successful transcription
         if CLEANUP_AUDIO_AFTER_TRANSCRIPTION {
             cleanup_recording_file(audio_file_path);
+        }
+
+        if !text.trim().is_empty() {
+            live_assist_bridge::chunk_transcribed(text);
+        }
+        if !paste_suffix.is_empty() {
+            live_assist_bridge::question_finalized();
         }
 
         let paste_text = format!("{}{}", text, paste_suffix);

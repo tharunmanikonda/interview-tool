@@ -1,0 +1,23 @@
+<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Rounded square background with warm gradient -->
+  <defs>
+    <linearGradient id="warmGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#e879a0" />
+      <stop offset="50%" style="stop-color:#f59e6b" />
+      <stop offset="100%" style="stop-color:#fbbf4a" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="102" fill="url(#warmGradient)" />
+
+  <!-- Sound waves (scaled up from 24x24 to fit 512x512, centered) -->
+  <g transform="translate(64, 64) scale(16)">
+    <path d="M2 12h2" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+    <path d="M5.5 7v10" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+    <path d="M9 3v18" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+    <path d="M12.5 6v12" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+    <path d="M16 9v6" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+    <!-- AI sparkles -->
+    <path d="M20 3l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7.7-2z" fill="white" />
+    <path d="M19.5 14l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5 1.5-.5.5-1.5z" fill="white" opacity="0.7" />
+  </g>
+</svg>

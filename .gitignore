@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+.output/
+.wxt/
+dist/
+build/
+target/
+coverage/
+
+# Logs and local runtime state
+*.log
+.logs/
+logs/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+.playwright-mcp/
+
+# Tauri/Rust local artifacts
+**/target/
+
+# Extension build output
+apps/extension/.output/

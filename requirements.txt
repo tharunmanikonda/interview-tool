@@ -1,0 +1,14 @@
+# Interview Tool does not use Python runtime dependencies.
+# This file is kept as a quick setup checklist for environments that expect requirements.txt.
+
+node>=20
+pnpm>=10
+rust>=1.80
+cargo>=1.80
+xcode-command-line-tools
+tauri-cli-v2
+chrome-or-arc-desktop
+chatgpt-account
+macos-microphone-permission
+macos-accessibility-permission
+openai-or-azure-openai-transcription-provider

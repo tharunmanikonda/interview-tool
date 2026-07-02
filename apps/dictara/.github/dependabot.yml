@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # NPM dependencies (root)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # NPM dependencies (landing)
+  - package-ecosystem: "npm"
+    directory: "/landing"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+
+  # Cargo/Rust dependencies
+  - package-ecosystem: "cargo"
+    directory: "/src-tauri"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5

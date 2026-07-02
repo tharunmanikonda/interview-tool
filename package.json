@@ -1,0 +1,39 @@
+{
+  "name": "gptdisguise-live-assist",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.4",
+  "workspaces": [
+    "apps/extension",
+    "apps/native-helper",
+    "apps/docs-server",
+    "apps/dictara",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:protocol": "pnpm --filter @gptdisguise/protocol build",
+    "typecheck:protocol": "pnpm --filter @gptdisguise/protocol typecheck",
+    "build:live-doc-core": "pnpm --filter @gptdisguise/live-doc-core build",
+    "typecheck:live-doc-core": "pnpm --filter @gptdisguise/live-doc-core typecheck",
+    "build:live-doc-ui": "pnpm --filter @gptdisguise/live-doc-ui build",
+    "typecheck:live-doc-ui": "pnpm --filter @gptdisguise/live-doc-ui typecheck",
+    "dev:extension": "pnpm --filter @gptdisguise/extension dev",
+    "build:extension": "pnpm --filter @gptdisguise/extension build",
+    "typecheck:extension": "pnpm --filter @gptdisguise/extension typecheck",
+    "dev:native": "pnpm --filter @gptdisguise/native-helper dev",
+    "build:native": "pnpm --filter @gptdisguise/native-helper build",
+    "typecheck:native": "pnpm --filter @gptdisguise/native-helper typecheck",
+    "dev:docs": "pnpm --filter @gptdisguise/docs-server dev",
+    "build:docs": "pnpm --filter @gptdisguise/docs-server build",
+    "typecheck:docs": "pnpm --filter @gptdisguise/docs-server typecheck",
+    "dev:dictara": "PATH=\"$HOME/.cargo/bin:$PATH\" pnpm --dir apps/dictara dev:tauri:no-reload",
+    "typecheck:dictara:frontend": "pnpm --dir apps/dictara fe:check",
+    "typecheck:dictara:rust": "cd apps/dictara/src-tauri && PATH=\"$HOME/.cargo/bin:$PATH\" cargo check",
+    "build": "pnpm build:protocol && pnpm build:live-doc-core && pnpm build:live-doc-ui && pnpm build:extension && pnpm build:native && pnpm build:docs",
+    "typecheck": "pnpm typecheck:protocol && pnpm typecheck:live-doc-core && pnpm typecheck:live-doc-ui && pnpm typecheck:extension && pnpm typecheck:native && pnpm typecheck:docs"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}

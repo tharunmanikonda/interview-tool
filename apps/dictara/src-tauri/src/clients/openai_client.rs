@@ -1,0 +1,52 @@
+use std::path::Path;
+
+use secrecy::{ExposeSecret, SecretString};
+
+use super::client::TranscriptionClient;
+use super::error::TranscriptionError;
+
+const OPENAI_TRANSCRIPTION_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_MODEL: &str = "whisper-1";
+
+/// OpenAI Whisper API client
+pub struct OpenAIClient {
+    api_key: SecretString,
+}
+
+impl OpenAIClient {
+    pub fn new(api_key: SecretString) -> Self {
+        Self { api_key }
+    }
+}
+
+impl TranscriptionClient for OpenAIClient {
+    fn transcription_url(&self) -> String {
+        OPENAI_TRANSCRIPTION_URL.to_string()
+    }
+
+    fn add_auth(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        request.bearer_auth(self.api_key.expose_secret())
+    }
+
+    fn build_form_from_path(
+        &self,
+        file_path: &Path,
+    ) -> Result<reqwest::blocking::multipart::Form, TranscriptionError> {
+        let form = reqwest::blocking::multipart::Form::new()
+            .file("file", file_path)
+            .map_err(|e| {
+                TranscriptionError::IoError(std::io::Error::other(format!(
+                    "Failed to read file: {}",
+                    e
+                )))
+            })?
+            .text("model", OPENAI_MODEL)
+            .text("temperature", "0.0")
+            .text("response_format", "json");
+
+        Ok(form)
+    }
+}

@@ -29,12 +29,39 @@ pub fn chunk_transcribed(text: &str) {
     BRIDGE.chunk_transcribed(text);
 }
 
-pub fn question_finalized() {
-    BRIDGE.question_finalized();
+pub fn transcript_delta(text: &str) {
+    BRIDGE.transcript_delta(text);
+}
+
+pub fn final_chunk_transcribed(text: &str) {
+    BRIDGE.final_chunk_transcribed(text);
+}
+
+pub fn starter_requested() {
+    BRIDGE.starter_requested();
+}
+
+pub fn buffer_cleared() {
+    BRIDGE.buffer_cleared();
 }
 
 pub fn capture_stopped() {
     BRIDGE.capture_stopped();
+}
+
+pub fn realtime_reconnecting(message: &str) {
+    BRIDGE.realtime_status("realtime_reconnecting", message);
+}
+
+pub fn realtime_reconnected() {
+    BRIDGE.realtime_status(
+        "realtime_reconnected",
+        "Realtime transcription reconnected.",
+    );
+}
+
+pub fn realtime_failed(message: &str) {
+    BRIDGE.realtime_status("realtime_failed", message);
 }
 
 pub fn transcription_error(message: &str) {
@@ -140,7 +167,12 @@ impl LiveAssistBridge {
         self.emit(event);
     }
 
-    fn question_finalized(&self) {
+    fn transcript_delta(&self, text: &str) {
+        let clean_text = text.trim();
+        if clean_text.is_empty() {
+            return;
+        }
+
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(error) => {
@@ -149,11 +181,69 @@ impl LiveAssistBridge {
             }
         };
 
+        if !state.active {
+            state.active = true;
+            state.session_id = Some(format!("dictara-{}", now_ms()));
+            state.chunk_index = 1;
+        }
+
+        let event = BridgeEvent::transcript_delta(&state, clean_text);
+        drop(state);
+        self.emit(event);
+    }
+
+    fn final_chunk_transcribed(&self, text: &str) {
+        let clean_text = text.trim();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                error!("Live Assist bridge state lock failed: {}", error);
+                return;
+            }
+        };
+
+        if !state.active {
+            state.active = true;
+            state.session_id = Some(format!("dictara-{}", now_ms()));
+            state.chunk_index = 1;
+        }
+
+        if !clean_text.is_empty() {
+            state.chunks.push(clean_text.to_string());
+        }
+
         let event = BridgeEvent::question_finalized(&state);
         state.active = false;
         state.chunks.clear();
         state.chunk_index = 0;
         state.session_id = None;
+        drop(state);
+        self.emit(event);
+    }
+
+    fn starter_requested(&self) {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                error!("Live Assist bridge state lock failed: {}", error);
+                return;
+            }
+        };
+
+        self.emit(BridgeEvent::starter_requested(&state));
+    }
+
+    fn buffer_cleared(&self) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                error!("Live Assist bridge state lock failed: {}", error);
+                return;
+            }
+        };
+
+        state.chunks.clear();
+        let event = BridgeEvent::buffer_cleared(&state);
         drop(state);
         self.emit(event);
     }
@@ -186,6 +276,18 @@ impl LiveAssistBridge {
         };
 
         self.emit(BridgeEvent::transcription_error(&state, message));
+    }
+
+    fn realtime_status(&self, event_type: &'static str, message: &str) {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                error!("Live Assist bridge state lock failed: {}", error);
+                return;
+            }
+        };
+
+        self.emit(BridgeEvent::status(event_type, &state, message));
     }
 
     fn emit(&self, event: BridgeEvent) {
@@ -331,7 +433,6 @@ impl BridgeEvent {
     }
 
     fn chunk_transcribed(state: &BridgeState, text: &str) -> Self {
-        let buffer = state.chunks.join(" ");
         Self {
             event_type: "chunk_transcribed",
             session_id: state.session_id.clone(),
@@ -341,7 +442,24 @@ impl BridgeEvent {
             started_at: None,
             completed_at: Some(now_ms()),
             engine: Some("api"),
-            starter: Some(build_starter(&buffer)),
+            starter: None,
+            error: None,
+            chunk_duration_ms: Some(CHUNK_DURATION_MS),
+            chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
+        }
+    }
+
+    fn transcript_delta(state: &BridgeState, text: &str) -> Self {
+        Self {
+            event_type: "transcript_delta",
+            session_id: state.session_id.clone(),
+            chunk_id: Some(format!("dictara-realtime-{}", state.chunk_index)),
+            text: Some(text.to_string()),
+            is_final: Some(false),
+            started_at: None,
+            completed_at: Some(now_ms()),
+            engine: Some("api"),
+            starter: None,
             error: None,
             chunk_duration_ms: Some(CHUNK_DURATION_MS),
             chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
@@ -363,11 +481,41 @@ impl BridgeEvent {
             started_at: None,
             completed_at: Some(now_ms()),
             engine: Some("api"),
-            starter: if text.is_empty() {
-                None
-            } else {
-                Some(build_starter(&text))
-            },
+            starter: None,
+            error: None,
+            chunk_duration_ms: Some(CHUNK_DURATION_MS),
+            chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
+        }
+    }
+
+    fn starter_requested(state: &BridgeState) -> Self {
+        Self {
+            event_type: "starter_requested",
+            session_id: state.session_id.clone(),
+            chunk_id: None,
+            text: None,
+            is_final: None,
+            started_at: None,
+            completed_at: Some(now_ms()),
+            engine: Some("api"),
+            starter: None,
+            error: None,
+            chunk_duration_ms: Some(CHUNK_DURATION_MS),
+            chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
+        }
+    }
+
+    fn buffer_cleared(state: &BridgeState) -> Self {
+        Self {
+            event_type: "buffer_cleared",
+            session_id: state.session_id.clone(),
+            chunk_id: None,
+            text: None,
+            is_final: None,
+            started_at: None,
+            completed_at: Some(now_ms()),
+            engine: Some("api"),
+            starter: None,
             error: None,
             chunk_duration_ms: Some(CHUNK_DURATION_MS),
             chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
@@ -407,25 +555,22 @@ impl BridgeEvent {
             chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
         }
     }
-}
 
-fn build_starter(text: &str) -> String {
-    let lower = text.to_lowercase();
-    let technical = lower.contains("redis")
-        || lower.contains("cache")
-        || lower.contains("database")
-        || lower.contains("api")
-        || lower.contains("latency")
-        || lower.contains("security")
-        || lower.contains("oauth")
-        || lower.contains("postgres")
-        || lower.contains("kubernetes")
-        || lower.contains("system design");
-
-    if technical {
-        "I’d approach this by separating the requirement, the tradeoff, and the implementation path.".to_string()
-    } else {
-        "That’s a good question. I’d start by clarifying the main goal, then answer with the key reasoning.".to_string()
+    fn status(event_type: &'static str, state: &BridgeState, message: &str) -> Self {
+        Self {
+            event_type,
+            session_id: state.session_id.clone(),
+            chunk_id: None,
+            text: None,
+            is_final: None,
+            started_at: None,
+            completed_at: Some(now_ms()),
+            engine: Some("api"),
+            starter: None,
+            error: Some(message.to_string()),
+            chunk_duration_ms: Some(CHUNK_DURATION_MS),
+            chunk_overlap_ms: Some(CHUNK_OVERLAP_MS),
+        }
     }
 }
 

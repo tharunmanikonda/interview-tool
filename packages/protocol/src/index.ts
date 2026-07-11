@@ -10,9 +10,15 @@ export type HelperEventType =
   | "helper_ready"
   | "capture_started"
   | "chunk_recording_started"
+  | "transcript_delta"
   | "chunk_transcribed"
   | "starter_updated"
+  | "starter_requested"
   | "question_finalized"
+  | "buffer_cleared"
+  | "realtime_reconnecting"
+  | "realtime_reconnected"
+  | "realtime_failed"
   | "capture_stopped"
   | "transcription_error";
 
@@ -172,8 +178,7 @@ export function appendTranscriptChunk(state: RollingQuestionState, event: Helper
   return {
     sessionId: event.sessionId || state.sessionId,
     chunks: [...state.chunks, { chunkId, text, completedAt: event.completedAt || Date.now() }],
-    buffer,
-    starter: buildStarterFromTranscript(buffer)
+    buffer
   };
 }
 
@@ -196,25 +201,6 @@ export function stitchTranscript(existing: string, next: string): string {
   }
 
   return `${cleanExisting} ${cleanNext}`.trim();
-}
-
-export function buildStarterFromTranscript(text: string): string {
-  const lower = text.toLowerCase();
-  const isYesNo = /^(would|do|does|did|can|could|should|is|are|will)\b/.test(lower);
-  const technical =
-    /(redis|cache|database|index|api|scale|latency|consistency|security|auth|oauth|postgres|kubernetes|system design|queue|event)/.test(
-      lower
-    );
-
-  if (isYesNo && technical) {
-    return "Yes, I’d answer directly first, then frame the tradeoff and constraint.";
-  }
-
-  if (technical) {
-    return "I’d approach this by separating the requirement, the tradeoff, and the implementation path.";
-  }
-
-  return "That’s a good question. I’d start by clarifying the main goal, then answer with the key reasoning.";
 }
 
 function normalizeTranscript(text: string): string {

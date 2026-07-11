@@ -10,7 +10,6 @@ import {
   NATIVE_BRIDGE_PORT,
   TranscriptionEngine,
   appendTranscriptChunk,
-  buildStarterFromTranscript,
   createEmptyRollingQuestion
 } from "@gptdisguise/protocol";
 
@@ -134,7 +133,6 @@ class RollingCaptureSession {
       type: "question_finalized",
       sessionId: this.sessionId,
       text: this.rolling.buffer,
-      starter: this.rolling.starter || buildStarterFromTranscript(this.rolling.buffer),
       isFinal: true,
       engine: this.engine,
       completedAt: Date.now()

@@ -2,6 +2,7 @@ mod audio_recorder;
 mod commands;
 mod controller;
 pub mod events;
+mod realtime_recorder;
 mod state_manager;
 pub mod vad;
 
@@ -17,6 +18,7 @@ pub use audio_recorder::{
 };
 pub use commands::RecordingCommand;
 pub use controller::Controller;
+pub use realtime_recorder::{RealtimeRecorderError, RealtimeRecording};
 
 /// Stores the last recording attempt for paste retry functionality
 #[derive(Debug, Clone)]

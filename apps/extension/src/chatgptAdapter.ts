@@ -47,6 +47,12 @@ export type ChatGptConversationMarkers = {
   markers: ChatGptConversationMarker[];
 };
 
+export type ChatGptSendTimings = {
+  onComposerInsertStarted?: () => void;
+  onComposerInsertCompleted?: () => void;
+  onSendClicked?: () => void;
+};
+
 const composerSelectors = [
   "#prompt-textarea",
   "[contenteditable='true'][id='prompt-textarea']",
@@ -142,17 +148,21 @@ export class ChatGptAdapter {
     };
   }
 
-  async sendPrompt(prompt: string) {
+  async sendPrompt(prompt: string, timings: ChatGptSendTimings = {}) {
     const composer = this.findComposer();
     if (!composer) {
       throw new Error("ChatGPT composer was not found.");
     }
 
-    await focusAndSetText(composer, prompt);
-    await waitFor(() => readableText(composer).includes(prompt.slice(0, 40)) || composerText(composer).includes(prompt.slice(0, 40)), 1200);
+    const safePrompt = cleanOutgoingPrompt(prompt);
+    timings.onComposerInsertStarted?.();
+    await focusAndSetText(composer, safePrompt);
+    await waitFor(() => readableText(composer).includes(safePrompt.slice(0, 40)) || composerText(composer).includes(safePrompt.slice(0, 40)), 1200);
+    timings.onComposerInsertCompleted?.();
 
     const submit = await waitFor(() => this.findSubmitButton(composer), 2500);
     if (submit) {
+      timings.onSendClicked?.();
       submit.click();
       await wait(180);
       return;
@@ -161,6 +171,7 @@ export class ChatGptAdapter {
     if (!pressEnter(composer)) {
       throw new Error("ChatGPT send button was not found or stayed disabled.");
     }
+    timings.onSendClicked?.();
     await wait(180);
   }
 
@@ -650,6 +661,10 @@ async function focusAndSetText(element: HTMLElement, text: string) {
   element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
 }
 
+function cleanOutgoingPrompt(prompt: string) {
+  return prompt.replaceAll("[[GPTD_LIVE_ASSIST_FINALIZE]]", "").trim();
+}
+
 function pressEnter(element: HTMLElement) {
   element.focus();
   const options: KeyboardEventInit = { key: "Enter", code: "Enter", bubbles: true, cancelable: true };
@@ -670,33 +685,49 @@ async function waitFor<T>(getter: () => T | null | undefined, timeoutMs: number)
 
 async function pasteTextIntoContentEditable(element: HTMLElement, text: string) {
   element.focus();
-  document.execCommand("selectAll");
+  clearEditableComposer(element);
+
+  const probe = text.slice(0, 40);
+  if (insertTextOnce(element, text, probe)) return;
 
   try {
-    dispatchTextPaste(element, text);
-    await wait(60);
-    if (readableText(element).includes(text.slice(0, 40))) return;
-
     const clipboard = await navigator.clipboard.readText().catch(() => "");
     await navigator.clipboard.writeText(text);
+    clearEditableComposer(element);
     document.execCommand("paste");
-    await wait(80);
-    if (!readableText(element).includes(text.slice(0, 40))) {
-      document.execCommand("insertText", false, text);
+    await wait(100);
+    if (readableText(element).includes(probe)) {
+      if (clipboard) await navigator.clipboard.writeText(clipboard).catch(() => undefined);
+      return;
     }
     if (clipboard) await navigator.clipboard.writeText(clipboard).catch(() => undefined);
   } catch {
-    element.textContent = "";
-    document.execCommand("insertText", false, text);
+    // Fall through to the DOM fallback below.
   }
+
+  clearEditableComposer(element);
+  element.textContent = text;
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
 }
 
-function dispatchTextPaste(element: HTMLElement, text: string) {
-  const data = new DataTransfer();
-  data.setData("text/plain", text);
-  element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
-  element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertFromPaste", data: text }));
-  document.execCommand("insertText", false, text);
+function clearEditableComposer(element: HTMLElement) {
+  element.focus();
+
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  document.execCommand("delete");
+  element.textContent = "";
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+}
+
+function insertTextOnce(element: HTMLElement, text: string, probe: string) {
+  element.focus();
+  const inserted = document.execCommand("insertText", false, text);
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+  return inserted && readableText(element).includes(probe);
 }
 
 function composerText(element: HTMLElement) {

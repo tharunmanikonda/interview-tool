@@ -75,6 +75,7 @@ export type HydratableConversationTurn = {
   question: string;
   questionImages?: ConversationImageAttachment[];
   questionFiles?: ConversationFileAttachment[];
+  starter?: string;
   answer: string;
   answerHtml?: string;
   answerImages?: ConversationImageAttachment[];
@@ -124,11 +125,13 @@ export class LiveAssistEngine {
       createdAt: Date.now()
     };
 
-    if (role === "interviewer" && !this.state.provisionalStarter) {
-      const starter = buildStarter(trimmed, starterMode);
-      if (starter) this.state.provisionalStarter = starter;
-    }
+    this.emit();
+  }
 
+  clearPartialTranscript() {
+    this.state.partialTranscript = undefined;
+    this.state.provisionalStarter = undefined;
+    if (this.state.phase === "listening") this.state.phase = "idle";
     this.emit();
   }
 
@@ -153,9 +156,7 @@ export class LiveAssistEngine {
       this.state.queuedQuestions.push({ id: event.id, text: trimmed, createdAt: event.createdAt });
     } else {
       this.state.currentQuestion = trimmed;
-      const starter = buildStarter(trimmed, starterMode);
-      this.state.provisionalStarter = starter || undefined;
-      this.ensureTurn(trimmed, starter?.text);
+      this.ensureTurn(trimmed, this.state.provisionalStarter?.text);
     }
 
     this.state.phase = this.state.phase === "generating" ? "generating" : "listening";
@@ -177,7 +178,7 @@ export class LiveAssistEngine {
     this.state.events.push(event);
     this.state.partialTranscript = undefined;
     this.state.currentQuestion = trimmed;
-    this.state.provisionalStarter = this.reconcileStarter(trimmed) || buildStarter(trimmed, starterMode) || undefined;
+    this.state.provisionalStarter = this.reconcileStarter(trimmed);
 
     const active = this.activeTurn();
     if (active && this.state.phase === "generating") {
@@ -222,7 +223,7 @@ export class LiveAssistEngine {
     };
   }
 
-  markGeneratingStarter(question: string) {
+  markGeneratingStarter(question: string, turnId?: string) {
     const trimmed = normalizeText(question);
     if (!trimmed) return;
 
@@ -230,14 +231,14 @@ export class LiveAssistEngine {
     this.state.currentAssistantAnswer = "";
     this.state.phase = "generating";
     this.state.provisionalStarter = undefined;
-    const turn = this.ensureTurn(trimmed);
+    const turn = this.ensureTurn(trimmed, undefined, turnId);
     this.state.activeTurnId = turn.id;
     turn.answer = "";
     turn.answerHtml = undefined;
     this.emit();
   }
 
-  markGenerating(question: string) {
+  markGenerating(question: string, turnId?: string) {
     if (this.state.currentAssistantAnswer.trim()) {
       this.state.previousAssistantAnswer = this.state.currentAssistantAnswer.trim();
     }
@@ -250,16 +251,31 @@ export class LiveAssistEngine {
     this.state.currentAssistantAnswer = "";
     this.state.phase = "generating";
     this.state.provisionalStarter = this.reconcileStarter(question);
-    const turn = this.ensureTurn(question, this.state.provisionalStarter?.text);
+    const turn = this.ensureTurn(question, this.state.provisionalStarter?.text, turnId);
     this.state.activeTurnId = turn.id;
     turn.answer = "";
     turn.answerHtml = undefined;
     this.emit();
   }
 
-  setAssistantAnswer(answer: string, answerHtml?: string) {
+  setStarterAnswer(answer: string, turnId?: string) {
+    const starterText = normalizeText(answer);
+    if (!starterText) return;
+
+    const turn = turnId ? this.turnById(turnId) : this.activeTurn();
+    if (turn) turn.starter = starterText;
+    this.state.provisionalStarter = {
+      id: createId("starter"),
+      text: starterText,
+      confidence: "medium",
+      sourceQuestion: this.state.currentQuestion || ""
+    };
+    this.emit();
+  }
+
+  setAssistantAnswer(answer: string, answerHtml?: string, turnId?: string) {
     this.state.currentAssistantAnswer = answer;
-    const turn = this.activeTurn();
+    const turn = turnId ? this.turnById(turnId) : this.activeTurn();
     if (turn) {
       turn.answer = answer;
       turn.answerHtml = answerHtml;
@@ -298,13 +314,14 @@ export class LiveAssistEngine {
         question: normalizeText(turn.question),
         questionImages: turn.questionImages,
         questionFiles: turn.questionFiles,
+        starter: normalizeText(turn.starter || "") || undefined,
         answer: normalizeText(turn.answer),
         answerHtml: turn.answerHtml,
         answerImages: turn.answerImages,
         answerFiles: turn.answerFiles,
         createdAt: turn.createdAt || Date.now()
       }))
-      .filter((turn) => turn.question || turn.answer || turn.questionImages?.length || turn.answerImages?.length || turn.questionFiles?.length || turn.answerFiles?.length);
+      .filter((turn) => turn.question || turn.questionImages?.length || turn.questionFiles?.length);
 
     if (hydratedTurns.length === 0) return;
 
@@ -343,13 +360,14 @@ export class LiveAssistEngine {
         question: normalizeText(turn.question),
         questionImages: turn.questionImages,
         questionFiles: turn.questionFiles,
+        starter: normalizeText(turn.starter || "") || undefined,
         answer: normalizeText(turn.answer),
         answerHtml: turn.answerHtml,
         answerImages: turn.answerImages,
         answerFiles: turn.answerFiles,
         createdAt: turn.createdAt || Date.now()
       }))
-      .filter((turn) => turn.question || turn.answer || turn.questionImages?.length || turn.answerImages?.length || turn.questionFiles?.length || turn.answerFiles?.length);
+      .filter((turn) => turn.question || turn.questionImages?.length || turn.questionFiles?.length);
 
     if (hydratedTurns.length === 0) return false;
 
@@ -384,6 +402,10 @@ export class LiveAssistEngine {
           existing.answerHtml = hydrated.answerHtml;
           existing.answerImages = hydrated.answerImages;
           existing.answerFiles = hydrated.answerFiles;
+          changed = true;
+        }
+        if (hydrated.starter && existing.starter !== hydrated.starter) {
+          existing.starter = hydrated.starter;
           changed = true;
         }
         merged.push(existing);
@@ -432,14 +454,16 @@ export class LiveAssistEngine {
     const next = this.state.queuedQuestions.shift();
     if (next) {
       this.state.currentQuestion = next.text;
-      this.state.provisionalStarter = buildStarter(next.text, "neutral-speculative") || undefined;
-      const turn = this.ensureTurn(next.text, this.state.provisionalStarter?.text);
+      this.state.provisionalStarter = undefined;
+      const turn = this.ensureTurn(next.text);
       this.state.activeTurnId = turn.id;
     }
   }
 
-  private ensureTurn(question: string, starter?: string) {
-    const existing = this.state.phase === "generating" && this.state.activeTurnId ? this.state.turns.find((turn) => turn.id === this.state.activeTurnId) : undefined;
+  private ensureTurn(question: string, starter?: string, turnId?: string) {
+    const existing =
+      (turnId ? this.turnById(turnId) : undefined) ||
+      (this.state.phase === "generating" && this.state.activeTurnId ? this.state.turns.find((turn) => turn.id === this.state.activeTurnId) : undefined);
     if (existing) {
       existing.question = question;
       if (starter && !existing.starter) existing.starter = starter;
@@ -447,7 +471,7 @@ export class LiveAssistEngine {
     }
 
     const turn: ConversationTurn = {
-      id: createId("turn"),
+      id: turnId || createId("turn"),
       question,
       starter,
       answer: "",
@@ -461,19 +485,13 @@ export class LiveAssistEngine {
     return this.state.turns.find((turn) => turn.id === this.state.activeTurnId);
   }
 
+  private turnById(turnId: string) {
+    return this.state.turns.find((turn) => turn.id === turnId);
+  }
+
   private reconcileStarter(question: string) {
     const current = this.state.provisionalStarter;
     if (!current) return undefined;
-
-    if (isStarterContradicted(current.text, question)) {
-      return {
-        ...current,
-        text: "I’d be careful there. The right answer depends on the constraint and the tradeoff.",
-        confidence: "low" as const,
-        sourceQuestion: question
-      };
-    }
-
     return { ...current, sourceQuestion: question };
   }
 
@@ -481,32 +499,6 @@ export class LiveAssistEngine {
     const snapshot = this.snapshot();
     this.listeners.forEach((listener) => listener(snapshot));
   }
-}
-
-function buildStarter(text: string, mode: StarterMode): ProvisionalStarter | undefined {
-  if (mode === "off") return undefined;
-
-  const lower = text.toLowerCase();
-  const isYesNo = /^(would|do|does|did|can|could|should|is|are|will|wouldn't|don't|doesn't)\b/.test(lower);
-  const mentionsTradeoff = /(redis|cache|database|index|api|scale|latency|consistency|security|auth|queue|event|microservice)/.test(lower);
-
-  let starter = "That’s a good question. I’d approach it by first clarifying the main constraint.";
-  let confidence: ProvisionalStarter["confidence"] = "low";
-
-  if (mode === "neutral-speculative" && isYesNo && mentionsTradeoff) {
-    starter = "Yes, I’d consider it, but I’d frame the answer around the tradeoff and constraints first.";
-    confidence = "medium";
-  } else if (mode === "neutral-speculative" && mentionsTradeoff) {
-    starter = "The way I’d think about that is by separating the core requirement from the implementation tradeoff.";
-    confidence = "medium";
-  }
-
-  return {
-    id: createId("starter"),
-    text: starter,
-    confidence,
-    sourceQuestion: text
-  };
 }
 
 function turnKey(turn: Pick<ConversationTurn, "question" | "answer" | "questionImages" | "answerImages" | "questionFiles" | "answerFiles">) {
@@ -539,12 +531,6 @@ function attachmentKey(images?: ConversationImageAttachment[], files?: Conversat
     ...(images?.map((image) => image.src) || []),
     ...(files?.map((file) => file.href || file.name) || [])
   ].join("|");
-}
-
-function isStarterContradicted(starter: string, question: string) {
-  const lowerStarter = starter.toLowerCase();
-  const lowerQuestion = question.toLowerCase();
-  return lowerStarter.startsWith("yes") && /(source of truth|financial transaction|password|secret|private key|never|not use)/.test(lowerQuestion);
 }
 
 function normalizeText(text: string) {

@@ -10,7 +10,8 @@ use crate::recording::{
     audio_recorder::{cleanup_recording_file, AudioRecorder},
     commands::RecordingCommand,
     events::RecordingStateChanged,
-    LastRecordingState, Recording, RecordingAction, RecordingStateManager, TransitionResult,
+    LastRecordingState, RealtimeRecording, Recording, RecordingAction, RecordingStateManager,
+    TransitionResult,
 };
 use crate::ui::menu::Menu;
 use crate::ui::window::{close_recording_popup, open_recording_popup};
@@ -108,6 +109,11 @@ pub struct Controller {
     menu: Menu,
 }
 
+enum ActiveRecording {
+    File(Recording),
+    Realtime(RealtimeRecording),
+}
+
 impl Controller {
     pub fn new(
         command_rx: Receiver<RecordingCommand>,
@@ -136,14 +142,23 @@ impl Controller {
     /// Main control loop - consumes self, runs in blocking thread
     pub fn run(mut self) {
         // Recording session lives here (not Send, so stays in this thread)
-        let mut current_recording: Option<Recording> = None;
+        let mut current_recording: Option<ActiveRecording> = None;
 
         while let Some(command) = self.command_rx.blocking_recv() {
+            let should_try_realtime = matches!(command, RecordingCommand::StartLiveAssistRecording)
+                && live_assist_realtime_enabled();
+
+            if self.execute_live_assist_realtime_command(&command, &mut current_recording) {
+                continue;
+            }
+
             // Attempt state transition
             match self.state_manager.transition(command.into()) {
                 Ok(TransitionResult::Changed { action, .. }) => {
                     if let Some(action) = action {
-                        if let Err(error) = self.execute_action(action, &mut current_recording) {
+                        if let Err(error) =
+                            self.execute_action(action, &mut current_recording, should_try_realtime)
+                        {
                             self.handle_action_error(error);
                         }
                     }
@@ -212,11 +227,24 @@ impl Controller {
     fn execute_action(
         &self,
         action: RecordingAction,
-        recording: &mut Option<Recording>,
+        recording: &mut Option<ActiveRecording>,
+        should_try_realtime: bool,
     ) -> Result<(), ActionError> {
         match action {
             RecordingAction::StartRecording => {
-                let rec = self.handle_start()?;
+                let rec = if should_try_realtime {
+                    match self.handle_realtime_start() {
+                        Ok(rec) => ActiveRecording::Realtime(rec),
+                        Err(error) => {
+                            return Err(ActionError::recording(
+                                format!("{}", error),
+                                error.user_message(),
+                            ));
+                        }
+                    }
+                } else {
+                    ActiveRecording::File(self.handle_start()?)
+                };
                 *recording = Some(rec);
             }
             RecordingAction::StopAndTranscribe => {
@@ -240,7 +268,7 @@ impl Controller {
                         ..
                     }) => {
                         let rec = self.handle_start()?;
-                        *recording = Some(rec);
+                        *recording = Some(ActiveRecording::File(rec));
                         if let Err(rejection) = self
                             .state_manager
                             .transition(RecordingCommand::LockRecording.into())
@@ -278,6 +306,55 @@ impl Controller {
         Ok(())
     }
 
+    fn execute_live_assist_realtime_command(
+        &self,
+        command: &RecordingCommand,
+        recording: &mut Option<ActiveRecording>,
+    ) -> bool {
+        if !live_assist_realtime_enabled() {
+            return false;
+        }
+
+        match command {
+            RecordingCommand::FinalizeRealtimeBuffer => {
+                if let Some(ActiveRecording::Realtime(realtime)) = recording.as_ref() {
+                    let text = realtime.snapshot_and_clear();
+                    live_assist_bridge::final_chunk_transcribed(&text);
+                } else {
+                    live_assist_bridge::transcription_error(
+                        "Realtime listener is not active. Start Live Assist listening first.",
+                    );
+                }
+                true
+            }
+            RecordingCommand::ClearRealtimeBuffer => {
+                if let Some(ActiveRecording::Realtime(realtime)) = recording.as_ref() {
+                    realtime.clear_buffer();
+                    live_assist_bridge::buffer_cleared();
+                } else {
+                    live_assist_bridge::transcription_error(
+                        "Realtime listener is not active. Start Live Assist listening first.",
+                    );
+                }
+                true
+            }
+            RecordingCommand::RequestRealtimeStarter => {
+                if recording
+                    .as_ref()
+                    .is_some_and(|rec| matches!(rec, ActiveRecording::Realtime(_)))
+                {
+                    live_assist_bridge::starter_requested();
+                } else {
+                    live_assist_bridge::transcription_error(
+                        "Realtime listener is not active. Start Live Assist listening first.",
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_start(&self) -> Result<Recording, ActionError> {
         live_assist_bridge::capture_started();
 
@@ -313,11 +390,48 @@ impl Controller {
         Ok(recording)
     }
 
-    fn handle_stop(&self, recording: Recording) -> Result<(), ActionError> {
+    fn handle_realtime_start(
+        &self,
+    ) -> Result<RealtimeRecording, crate::recording::RealtimeRecorderError> {
+        let level_channel = match self.audio_level_channel.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                log::error!("Failed to lock audio_level_channel: {}", e);
+                None
+            }
+        };
+
+        let recording = RealtimeRecording::start(level_channel)?;
+
+        live_assist_bridge::capture_started();
+
+        if let Err(e) = RecordingStateChanged::Started.emit(&self.app_handle) {
+            log::error!("Failed to emit realtime started event: {}", e);
+        }
+
+        Ok(recording)
+    }
+
+    fn handle_stop(&self, recording: ActiveRecording) -> Result<(), ActionError> {
         self.handle_stop_with_suffix(recording, "")
     }
 
     fn handle_stop_with_suffix(
+        &self,
+        recording: ActiveRecording,
+        paste_suffix: &str,
+    ) -> Result<(), ActionError> {
+        match recording {
+            ActiveRecording::File(recording) => {
+                self.handle_file_stop_with_suffix(recording, paste_suffix)
+            }
+            ActiveRecording::Realtime(recording) => {
+                self.handle_realtime_stop(recording, paste_suffix)
+            }
+        }
+    }
+
+    fn handle_file_stop_with_suffix(
         &self,
         recording: Recording,
         paste_suffix: &str,
@@ -362,7 +476,83 @@ impl Controller {
         )
     }
 
-    fn handle_cancel(&self, recording: Recording) -> Result<(), ActionError> {
+    fn handle_realtime_stop(
+        &self,
+        recording: RealtimeRecording,
+        paste_suffix: &str,
+    ) -> Result<(), ActionError> {
+        if let Err(e) = RecordingStateChanged::Transcribing.emit(&self.app_handle) {
+            log::error!("Failed to emit realtime transcribing event: {:?}", e);
+        }
+
+        let text = recording
+            .stop()
+            .map_err(|error| ActionError::recording(format!("{}", error), error.user_message()))?;
+
+        self.state_manager.reset();
+
+        if text.trim().is_empty() {
+            if !paste_suffix.is_empty() {
+                log::info!("Final realtime capture had no transcript; finalizing empty question");
+                live_assist_bridge::final_chunk_transcribed("");
+                return Ok(());
+            }
+            return Err(ActionError::no_speech());
+        }
+
+        if !paste_suffix.is_empty() {
+            live_assist_bridge::final_chunk_transcribed(&text);
+        } else {
+            live_assist_bridge::chunk_transcribed(&text);
+        }
+
+        match self.last_recording_state.lock() {
+            Ok(mut last_recording) => {
+                last_recording.text = Some(text.clone());
+                last_recording.timestamp = Some(std::time::SystemTime::now());
+                last_recording.audio_file_path = None;
+            }
+            Err(e) => {
+                log::error!("Failed to lock last_recording_state: {}", e);
+            }
+        }
+
+        if let Err(e) = self.menu.set_paste_last_active() {
+            log::error!("Failed to enable paste menu item: {}", e);
+        }
+
+        if let Err(e) = close_recording_popup(&self.app_handle) {
+            log::error!("Failed to close recording popup: {}", e);
+        }
+
+        if let Err(e) = (RecordingStateChanged::Stopped { text }).emit(&self.app_handle) {
+            log::error!("Failed to emit realtime stopped event: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn handle_cancel(&self, recording: ActiveRecording) -> Result<(), ActionError> {
+        let recording = match recording {
+            ActiveRecording::File(recording) => recording,
+            ActiveRecording::Realtime(realtime) => {
+                realtime.cancel();
+                live_assist_bridge::capture_stopped();
+
+                if let Err(e) = close_recording_popup(&self.app_handle) {
+                    log::error!("Failed to close recording popup: {}", e);
+                }
+
+                RecordingStateChanged::Cancelled
+                    .emit(&self.app_handle)
+                    .map_err(|e| {
+                        ActionError::cancel(format!("Failed to emit cancelled event: {}", e))
+                    })?;
+
+                return Ok(());
+            }
+        };
+
         // Stop recording (creates file but we don't use it)
         let recording_result = recording
             .stop()
@@ -461,11 +651,10 @@ impl Controller {
             cleanup_recording_file(audio_file_path);
         }
 
-        if !text.trim().is_empty() {
-            live_assist_bridge::chunk_transcribed(text);
-        }
         if !paste_suffix.is_empty() {
-            live_assist_bridge::question_finalized();
+            live_assist_bridge::final_chunk_transcribed(text);
+        } else if !text.trim().is_empty() {
+            live_assist_bridge::chunk_transcribed(text);
         }
 
         let paste_text = format!("{}{}", text, paste_suffix);
@@ -509,4 +698,11 @@ impl Controller {
 
         Ok(())
     }
+}
+
+fn live_assist_realtime_enabled() -> bool {
+    matches!(
+        std::env::var("DICTARA_LIVE_ASSIST_REALTIME").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }

@@ -1512,6 +1512,7 @@ name = "dictara"
 version = "0.2.4"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "block2",
  "cpal",
  "derive_more 2.1.1",
@@ -7049,7 +7050,9 @@ checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "tokio",
+ "tokio-native-tls",
  "tungstenite",
 ]
 
@@ -7299,6 +7302,7 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.8.5",
  "sha1",
  "thiserror 1.0.69",

@@ -201,6 +201,7 @@ cargo check
 - `apps/dictara/src-tauri/src/keyboard_listener.rs` - Dictara hotkey behavior.
 - `apps/dictara/src-tauri/src/recording/controller.rs` - Dictara rolling recording/finalize behavior.
 - `packages/protocol/src/index.ts` - shared helper event/command schema.
+- `docs/CODING_INTERVIEW_MODE.md` - planned coding interview mode strategy, prompt types, screenshot handling, and answer shape.
 
 ## Troubleshooting
 

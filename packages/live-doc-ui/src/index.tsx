@@ -188,9 +188,9 @@ function TurnCard({
   const answerAttachments = turn.answerAttachments || [];
   const hasLongQuestion = turn.question.length > 260 || questionAttachments.length > 0;
   const hasRichAnswer = Boolean(turn.answerHtml);
-  const displayAnswer = useTypewriterText(turn.answer || "", !hasRichAnswer && shouldAnimateAnswer && Boolean(turn.answer));
+  const displayAnswer = useTypewriterText(turn.answer || "", shouldAnimateAnswer && Boolean(turn.answer));
   const isTypingAnswer = displayAnswer.length < (turn.answer || "").length;
-  const showRichAnswer = hasRichAnswer;
+  const showRichAnswer = hasRichAnswer && !isTypingAnswer;
 
   return (
     <article data-turn-id={turn.id} className={[`${prefix}-turn`, viewMode, isActive ? "active" : "", isLatest ? "latest" : ""].filter(Boolean).join(" ")}>
@@ -217,29 +217,32 @@ function TurnCard({
 function useTypewriterText(target: string, active: boolean) {
   const [displayed, setDisplayed] = useState(active ? "" : target);
 
-  const shouldAnimate = active || (displayed.length > 0 && target.startsWith(displayed) && displayed.length < target.length);
-
   useEffect(() => {
+    if (!active) {
+      setDisplayed(target);
+      return;
+    }
+
     setDisplayed((current) => {
       if (!target) return "";
       if (target.startsWith(current) && target.length >= current.length) return current;
-      return active ? "" : target;
+      return "";
     });
   }, [active, target]);
 
   useEffect(() => {
-    if (!shouldAnimate || displayed.length >= target.length) return undefined;
+    if (!active || displayed.length >= target.length) return undefined;
 
     const timer = window.setTimeout(() => {
       setDisplayed((current) => {
         const remaining = target.length - current.length;
-        const step = Math.max(1, Math.min(96, Math.ceil(remaining / 12)));
+        const step = Math.max(2, Math.min(96, Math.ceil(remaining / 6)));
         return target.slice(0, current.length + step);
       });
-    }, 24);
+    }, 16);
 
     return () => window.clearTimeout(timer);
-  }, [shouldAnimate, displayed, target]);
+  }, [active, displayed, target]);
 
   return displayed;
 }

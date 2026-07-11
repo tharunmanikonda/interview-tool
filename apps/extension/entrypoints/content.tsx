@@ -69,15 +69,24 @@ type DebugEntry = {
   createdAt: string;
 };
 
+type CaptureTimelineEntry = {
+  id: string;
+  label: string;
+  detail?: string;
+  createdAt: string;
+};
+
 type LatencyState = {
   status: "idle" | "waiting" | "streaming" | "rendered";
   startedAt?: number;
   submittedAt?: number;
   firstAnswerAt?: number;
   lastRenderAt?: number;
+  checkpoints?: Record<string, number>;
 };
 
 type ActiveRequest = {
+  turnId: string;
   question: string;
   assistantStartCount: number;
   kind: "starter" | "final";
@@ -91,6 +100,42 @@ type StarterRequestPolicy = {
 
 type ReaderViewMode = "reader" | "focus";
 type ReaderTheme = "light" | "dark";
+
+type TurnLedgerStatus =
+  | "draft"
+  | "starter_waiting"
+  | "starter_streaming"
+  | "starter_done"
+  | "final_waiting"
+  | "final_streaming"
+  | "done"
+  | "send_failed"
+  | "interrupted"
+  | "needs_retry";
+
+type TurnLedgerLatency = {
+  startedAt?: number;
+  submittedAt?: number;
+  firstAnswerAt?: number;
+  lastRenderAt?: number;
+  checkpoints?: Record<string, number>;
+};
+
+type StoredTurnLedgerEntry = {
+  schemaVersion: 2;
+  id: string;
+  conversationId: string;
+  question: string;
+  starter?: string;
+  answer: string;
+  answerHtml?: string;
+  status: TurnLedgerStatus;
+  requestKind?: "starter" | "final";
+  createdAt: number;
+  updatedAt: number;
+  latency?: TurnLedgerLatency;
+  error?: string;
+};
 
 type StoredChatMessage = {
   key: string;
@@ -110,6 +155,7 @@ type StoredChatHistoryMetadata = {
 };
 
 const LIVE_ASSIST_FINALIZE_MARKER = "[[GPTD_LIVE_ASSIST_FINALIZE]]";
+const TURN_LEDGER_STORAGE_PREFIX = "gptd-turn-ledger:v2:";
 const CHAT_HISTORY_STORAGE_PREFIX = "gptd-chat-history:";
 const CHAT_SCROLL_STORAGE_PREFIX = "gptd-chat-scroll:";
 const LIVE_DOC_SESSION_STORAGE_PREFIX = "gptd-live-doc-session:";
@@ -184,43 +230,107 @@ function waitForBody() {
 function messagesToHydratedTurns(messages: StoredChatMessage[]) {
   const turns: HydratableConversationTurn[] = [];
   const orderedMessages = [...messages].sort((a, b) => a.order - b.order);
-  let latestUserKey = "";
+  let pendingUser: StoredChatMessage | undefined;
+
+  function findMatchingTurn(question: string) {
+    const normalized = normalizeForHistory(question);
+    if (!normalized) return undefined;
+    return turns.find((turn) => {
+      const existing = normalizeForHistory(turn.question);
+      return existing === normalized || existing.includes(normalized) || normalized.includes(existing);
+    });
+  }
+
+  function upsertInternalTurn(userMessage: StoredChatMessage, assistantMessage?: StoredChatMessage) {
+    const question = extractQuestionFromPrompt(userMessage.text);
+    if (!question && !userMessage.images?.length && !userMessage.files?.length) return undefined;
+
+    let turn = findMatchingTurn(question);
+    if (!turn) {
+      turn = {
+        id: liveTurnIdFromMessageKeys(userMessage.key, assistantMessage?.key),
+        question,
+        questionImages: userMessage.images,
+        questionFiles: userMessage.files,
+        answer: "",
+        createdAt: userMessage.updatedAt
+      };
+      turns.push(turn);
+    } else {
+      if (question.length > turn.question.length && question.includes(turn.question)) turn.question = question;
+      if (userMessage.images?.length) turn.questionImages = userMessage.images;
+      if (userMessage.files?.length) turn.questionFiles = userMessage.files;
+      if (assistantMessage) turn.id = liveTurnIdFromMessageKeys(userMessage.key, assistantMessage.key);
+    }
+
+    return turn;
+  }
+
+  function flushPendingUser() {
+    if (!pendingUser) return;
+    if (classifyPromptMessage(pendingUser.text) !== "normal") {
+      pendingUser = undefined;
+      return;
+    }
+
+    turns.push({
+      id: liveTurnIdFromMessageKeys(pendingUser.key),
+      question: extractQuestionFromPrompt(pendingUser.text),
+      questionImages: pendingUser.images,
+      questionFiles: pendingUser.files,
+      answer: "",
+      createdAt: pendingUser.updatedAt
+    });
+    pendingUser = undefined;
+  }
 
   for (const message of orderedMessages) {
     if (message.role === "user") {
-      latestUserKey = message.key;
-      turns.push({
-        id: liveTurnIdFromMessageKeys(message.key),
-        question: extractQuestionFromPrompt(message.text),
-        questionImages: message.images,
-        questionFiles: message.files,
-        answer: "",
-        createdAt: message.updatedAt
-      });
+      flushPendingUser();
+      pendingUser = message;
       continue;
     }
 
-    const latest = turns.at(-1);
-    if (latest && !latest.answer) {
-      latest.id = liveTurnIdFromMessageKeys(latestUserKey, message.key);
-      latest.answer = message.text;
-      latest.answerHtml = message.html;
-      latest.answerImages = message.images;
-      latest.answerFiles = message.files;
+    if (pendingUser) {
+      const promptKind = classifyPromptMessage(pendingUser.text);
+
+      if (promptKind === "starter") {
+        const turn = upsertInternalTurn(pendingUser, message);
+        if (turn && message.text.trim()) turn.starter = message.text;
+      } else if (promptKind === "final") {
+        const turn = upsertInternalTurn(pendingUser, message);
+        if (turn) {
+          turn.answer = message.text;
+          turn.answerHtml = message.html;
+          turn.answerImages = message.images;
+          turn.answerFiles = message.files;
+        }
+      } else {
+        turns.push({
+          id: liveTurnIdFromMessageKeys(pendingUser.key, message.key),
+          question: extractQuestionFromPrompt(pendingUser.text),
+          questionImages: pendingUser.images,
+          questionFiles: pendingUser.files,
+          answer: message.text,
+          answerHtml: message.html,
+          answerImages: message.images,
+          answerFiles: message.files,
+          createdAt: pendingUser.updatedAt
+        });
+      }
+
+      pendingUser = undefined;
     } else {
-      turns.push({
-        id: liveTurnIdFromMessageKeys("", message.key),
-        question: "",
-        answer: message.text,
-        answerHtml: message.html,
-        answerImages: message.images,
-        answerFiles: message.files,
-        createdAt: message.updatedAt
-      });
+      // ChatGPT turns should arrive as user -> assistant pairs. If an assistant
+      // message is orphaned here, it usually came from stale local storage from
+      // an older broken sync and should not become its own fake question card.
+      continue;
     }
   }
 
-  return turns.filter((turn) => turn.question || turn.answer || turn.questionImages?.length || turn.answerImages?.length || turn.questionFiles?.length || turn.answerFiles?.length);
+  flushPendingUser();
+
+  return turns.filter((turn) => turn.question || turn.questionImages?.length || turn.questionFiles?.length);
 }
 
 function liveTurnIdFromMessageKeys(userKey: string, assistantKey = "") {
@@ -228,18 +338,19 @@ function liveTurnIdFromMessageKeys(userKey: string, assistantKey = "") {
 }
 
 function extractQuestionFromPrompt(text: string) {
+  const cleanedText = cleanInternalPromptText(text);
   const markers = [
     "Current complete question:",
     "Current interviewer question:",
     "Partial interviewer question so far:",
     "Partial question so far:"
   ];
-  const marker = markers.find((candidate) => text.includes(candidate));
-  if (!marker) return text;
+  const marker = markers.find((candidate) => cleanedText.includes(candidate));
+  if (!marker) return cleanedText;
 
-  const markerIndex = text.indexOf(marker);
+  const markerIndex = cleanedText.indexOf(marker);
 
-  const afterMarker = text.slice(markerIndex + marker.length).trim();
+  const afterMarker = cleanedText.slice(markerIndex + marker.length).trim();
   const nextSectionIndex = afterMarker.search(/\n\s*\n[A-Z][^:\n]+:/);
   const section = nextSectionIndex === -1 ? afterMarker : afterMarker.slice(0, nextSectionIndex);
   const cleanupMarkers = [
@@ -253,7 +364,26 @@ function extractQuestionFromPrompt(text: string) {
     .map((candidate) => section.indexOf(candidate))
     .filter((index) => index >= 0)
     .sort((a, b) => a - b)[0];
-  return (cleanupIndex === undefined ? section : section.slice(0, cleanupIndex)).trim() || text;
+  return (cleanupIndex === undefined ? section : section.slice(0, cleanupIndex)).trim() || cleanedText;
+}
+
+function classifyPromptMessage(text: string): "normal" | "starter" | "final" {
+  const cleaned = cleanInternalPromptText(text);
+  const hasStarterShape = cleaned.includes("The interviewer is still asking a question") || cleaned.includes("Return only the bridge sentence");
+  const hasFinalShape = cleaned.includes("The interviewer has now completed the question") || cleaned.includes("Starter already shown to the candidate:");
+
+  if (hasFinalShape && cleaned.includes("Current complete question:")) return "final";
+  if (hasStarterShape && cleaned.includes("Partial question so far:")) return "starter";
+  return "normal";
+}
+
+function cleanInternalPromptText(text: string) {
+  return text
+    .replaceAll(LIVE_ASSIST_FINALIZE_MARKER, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+(Current complete question:|Current interviewer question:|Partial interviewer question so far:|Partial question so far:)/g, "\n\n$1")
+    .replace(/\s+(Starter already shown to the candidate:|Candidate actually said so far:)/g, "\n\n$1")
+    .trim();
 }
 
 function chatHistorySignature(messages: StoredChatMessage[]) {
@@ -274,6 +404,112 @@ function getChatConversationId() {
   const match = window.location.pathname.match(/\/c\/([^/?#]+)/);
   if (match?.[1]) return match[1];
   return `path:${window.location.pathname || "/"}`;
+}
+
+function turnLedgerKey(conversationId: string) {
+  return `${TURN_LEDGER_STORAGE_PREFIX}${conversationId}`;
+}
+
+async function loadTurnLedger(conversationId: string): Promise<StoredTurnLedgerEntry[]> {
+  const key = turnLedgerKey(conversationId);
+  const result = await safeStorageGet(key);
+  const turns = result[key]?.turns;
+  await safeStorageRemove(`${CHAT_HISTORY_STORAGE_PREFIX}${conversationId}`);
+  if (!Array.isArray(turns)) return [];
+
+  let changed = false;
+  const nextTurns = turns
+    .filter(isStoredTurnLedgerEntry)
+    .map((turn) => {
+      if (isInterruptedLedgerStatus(turn.status)) {
+        changed = true;
+        return {
+          ...turn,
+          status: turn.answer || turn.starter ? "interrupted" as const : "needs_retry" as const,
+          updatedAt: Date.now(),
+          error: turn.error || "Page refreshed before this response completed."
+        };
+      }
+      return turn;
+    })
+    .filter((turn) => turn.question.trim())
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+  if (changed) await saveTurnLedger(conversationId, nextTurns);
+  return nextTurns;
+}
+
+async function saveTurnLedger(conversationId: string, turns: StoredTurnLedgerEntry[]) {
+  if (!conversationId) return;
+  await safeStorageSet({
+    [turnLedgerKey(conversationId)]: {
+      schemaVersion: 2,
+      conversationId,
+      updatedAt: Date.now(),
+      turns: turns.slice(-120).map((turn) => stripUndefined(turn))
+    }
+  });
+}
+
+async function clearTurnLedger(conversationId: string) {
+  if (!conversationId) return;
+  await safeStorageRemove(turnLedgerKey(conversationId));
+}
+
+function ledgerTurnToHydratable(turn: StoredTurnLedgerEntry): HydratableConversationTurn {
+  return {
+    id: turn.id,
+    question: turn.question,
+    starter: turn.starter,
+    answer: turn.answer || turn.error || "",
+    answerHtml: turn.answerHtml,
+    createdAt: turn.createdAt
+  };
+}
+
+function isInterruptedLedgerStatus(status: TurnLedgerStatus) {
+  return status === "starter_waiting" || status === "starter_streaming" || status === "final_waiting" || status === "final_streaming";
+}
+
+function isStoredTurnLedgerEntry(value: unknown): value is StoredTurnLedgerEntry {
+  if (!value || typeof value !== "object") return false;
+  const turn = value as Partial<StoredTurnLedgerEntry>;
+  return (
+    turn.schemaVersion === 2 &&
+    typeof turn.id === "string" &&
+    typeof turn.conversationId === "string" &&
+    typeof turn.question === "string" &&
+    typeof turn.answer === "string" &&
+    typeof turn.status === "string" &&
+    typeof turn.createdAt === "number" &&
+    typeof turn.updatedAt === "number"
+  );
+}
+
+function createLedgerTurn(conversationId: string, question: string): StoredTurnLedgerEntry {
+  const now = Date.now();
+  return {
+    schemaVersion: 2,
+    id: `ledger-turn-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    conversationId,
+    question,
+    answer: "",
+    status: "draft",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function normalizeQuestionForLedger(question: string) {
+  return question.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function shouldSendStarterForChunk(event: HelperEvent) {
+  if (event.isFinal) return false;
+  if (typeof event.startedAt === "number" && typeof event.completedAt === "number") {
+    return event.completedAt - event.startedAt >= 9_500;
+  }
+  return true;
 }
 
 async function loadStoredChatMessages(conversationId: string): Promise<StoredChatMessage[]> {
@@ -508,7 +744,15 @@ function mergeChatMessages(existing: StoredChatMessage[], incoming: StoredChatMe
     });
   }
 
-  return [...byKey.values()].sort((a, b) => a.order - b.order);
+  return dropOrphanAssistantMessages([...byKey.values()].sort((a, b) => a.order - b.order));
+}
+
+function dropOrphanAssistantMessages(messages: StoredChatMessage[]) {
+  return messages.filter((message, index) => {
+    if (message.role !== "assistant") return true;
+    const previous = messages[index - 1];
+    return previous?.role === "user";
+  });
 }
 
 function stripUndefined<T>(value: T): T {
@@ -565,6 +809,7 @@ function LiveAssistOverlay() {
   const [statusText, setStatusText] = useState("Ready");
   const [debugEntries, setDebugEntries] = useState<DebugEntry[]>([]);
   const [showDebug, setShowDebug] = useState(false);
+  const [captureTimeline, setCaptureTimeline] = useState<CaptureTimelineEntry[]>([]);
   const [isVoiceCapture, setIsVoiceCapture] = useState(true);
   const [latency, setLatency] = useState<LatencyState>({ status: "idle" });
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -581,8 +826,6 @@ function LiveAssistOverlay() {
   const [draftLiveDocServerUrl, setDraftLiveDocServerUrl] = useState(() => defaultDocsServerUrl());
   const captureTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const docScrollRef = useRef<HTMLElement | null>(null);
-  const chatGptScrollRafRef = useRef<number | undefined>(undefined);
-  const pendingChatGptScrollDeltaRef = useRef(0);
   const silentDocScrollUntilRef = useRef(0);
   const autoFollowLatestRef = useRef(true);
   const lastDocScrollTopRef = useRef(0);
@@ -594,8 +837,13 @@ function LiveAssistOverlay() {
   const lastFlowSubmittedRef = useRef("");
   const nativeStatusRef = useRef<NativeBridgeStatus>("disconnected");
   const rollingQuestionRef = useRef<RollingQuestionState>(createEmptyRollingQuestion());
+  const realtimeCaptureStartedAtRef = useRef<number | undefined>(undefined);
+  const realtimeStarterTimerRef = useRef<number | undefined>(undefined);
   const finalizeAfterNextChunkRef = useRef(false);
   const activeRequestRef = useRef<ActiveRequest | null>(null);
+  const firstAnswerNotifiedForRequestRef = useRef<string | undefined>(undefined);
+  const ledgerTurnsRef = useRef<StoredTurnLedgerEntry[]>([]);
+  const activeLedgerTurnIdRef = useRef<string | undefined>(undefined);
   const answerStableTimerRef = useRef<number | undefined>(undefined);
   const stateRef = useRef<ConversationState>(engine.snapshot());
   const starterSentRef = useRef(false);
@@ -603,7 +851,6 @@ function LiveAssistOverlay() {
   const lastStarterQuestionSentRef = useRef("");
   const pendingStarterQuestionRef = useRef("");
   const pendingFinalSendRef = useRef(false);
-  const lastHydratedSignatureRef = useRef("");
   const [conversationId, setConversationId] = useState(() => getChatConversationId());
   const conversationIdRef = useRef(conversationId);
 
@@ -614,6 +861,56 @@ function LiveAssistOverlay() {
       createdAt: new Date().toLocaleTimeString()
     };
     setDebugEntries((entries) => [entry, ...entries].slice(0, 8));
+  }
+
+  function captureTimelineEvent(label: string, detail?: string) {
+    const entry: CaptureTimelineEntry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      label,
+      detail,
+      createdAt: new Date().toLocaleTimeString()
+    };
+    setCaptureTimeline((entries) => [entry, ...entries].slice(0, 12));
+  }
+
+  function setLatencyCheckpoint(name: string, value = performance.now()) {
+    setLatency((current) => ({
+      ...current,
+      checkpoints: {
+        ...current.checkpoints,
+        [name]: value
+      }
+    }));
+  }
+
+  function recordTurnLatencyCheckpoint(turnId: string, name: string, value = performance.now()) {
+    setLatencyCheckpoint(name, value);
+    updateLedgerTurn(
+      turnId,
+      (turn) => ({
+        ...turn,
+        latency: {
+          ...turn.latency,
+          checkpoints: {
+            ...turn.latency?.checkpoints,
+            [name]: value
+          }
+        }
+      }),
+      { hydrate: false }
+    );
+  }
+
+  function chatGptSendTimings(turnId: string) {
+    return {
+      onComposerInsertStarted: () => recordTurnLatencyCheckpoint(turnId, "composerInsertStartedAt"),
+      onComposerInsertCompleted: () => recordTurnLatencyCheckpoint(turnId, "composerInsertCompletedAt"),
+      onSendClicked: () => {
+        const now = performance.now();
+        recordTurnLatencyCheckpoint(turnId, "sendClickedAt", now);
+        captureTimelineEvent("sent", "Prompt submitted to ChatGPT");
+      }
+    };
   }
 
   function scrollLatestTurnIntoView(align: "start" | "end" = "start") {
@@ -724,23 +1021,56 @@ function LiveAssistOverlay() {
     return adapter.readConversation().filter((turn) => turn.role === "assistant").at(-1)?.text || "";
   }
 
-  async function syncVisibleChatGptTurns(reason: string) {
-    const visibleMessages = adapter.readConversation().map(chatGptTurnToStoredMessage);
-    if (visibleMessages.length === 0) return false;
-    const markers = adapter.readConversationMarkers();
-
-    const storedMessages = await loadStoredChatMessages(conversationIdRef.current);
-    const mergedMessages = mergeChatMessages(storedMessages, visibleMessages);
-    const signature = `${chatHistorySignature(mergedMessages)}::markers:${markers.signature}`;
-    if (signature === lastHydratedSignatureRef.current) return false;
-
-    lastHydratedSignatureRef.current = signature;
-    await saveStoredChatMessages(conversationIdRef.current, mergedMessages, markerMetadata(markers));
-    if (!activeRequestRef.current) {
-      engine.hydrateTurns(messagesToHydratedTurns(mergedMessages));
+  function hydrateEngineFromLedger(turns = ledgerTurnsRef.current) {
+    const hydratedTurns = turns.map(ledgerTurnToHydratable).filter((turn) => turn.question.trim());
+    if (hydratedTurns.length === 0) {
+      engine.reset();
+      return;
     }
-    debug(markers.count > 0 ? `${reason} · markers ${markers.count}${markers.activeIndex === undefined ? "" : ` active ${markers.activeIndex + 1}`}` : reason);
-    return true;
+    engine.hydrateTurns(hydratedTurns);
+  }
+
+  function setLedgerTurns(nextTurns: StoredTurnLedgerEntry[], options: { hydrate?: boolean } = {}) {
+    const sortedTurns = [...nextTurns].filter((turn) => turn.question.trim()).sort((a, b) => a.createdAt - b.createdAt);
+    ledgerTurnsRef.current = sortedTurns;
+    void saveTurnLedger(conversationIdRef.current, sortedTurns);
+    if (options.hydrate) hydrateEngineFromLedger(sortedTurns);
+  }
+
+  function updateLedgerTurn(turnId: string, updater: (turn: StoredTurnLedgerEntry) => StoredTurnLedgerEntry, options: { hydrate?: boolean } = {}) {
+    const nextTurns = ledgerTurnsRef.current.map((turn) => (turn.id === turnId ? stripUndefined(updater({ ...turn, updatedAt: Date.now() })) : turn));
+    setLedgerTurns(nextTurns, options);
+    return nextTurns.find((turn) => turn.id === turnId);
+  }
+
+  function ensureLedgerTurn(question: string) {
+    const normalizedQuestion = question.trim();
+    const activeTurn = activeLedgerTurnIdRef.current ? ledgerTurnsRef.current.find((turn) => turn.id === activeLedgerTurnIdRef.current) : undefined;
+    if (activeTurn) {
+      const updated = updateLedgerTurn(
+        activeTurn.id,
+        (turn) => ({
+          ...turn,
+          question: normalizedQuestion.length >= turn.question.length ? normalizedQuestion : turn.question
+        }),
+        { hydrate: false }
+      );
+      return updated || activeTurn;
+    }
+
+    const normalized = normalizeQuestionForLedger(normalizedQuestion);
+    const recentDuplicate = [...ledgerTurnsRef.current]
+      .reverse()
+      .find((turn) => normalizeQuestionForLedger(turn.question) === normalized && Date.now() - turn.createdAt < 6000);
+    if (recentDuplicate) {
+      activeLedgerTurnIdRef.current = recentDuplicate.id;
+      return recentDuplicate;
+    }
+
+    const turn = createLedgerTurn(conversationIdRef.current, normalizedQuestion);
+    activeLedgerTurnIdRef.current = turn.id;
+    setLedgerTurns([...ledgerTurnsRef.current, turn], { hydrate: true });
+    return turn;
   }
 
   function updateAutoFollowFromManualScroll() {
@@ -760,20 +1090,6 @@ function LiveAssistOverlay() {
 
     lastDocScrollTopRef.current = currentTop;
     return delta;
-  }
-
-  function syncChatGptScrollByDelta(deltaY: number) {
-    if (Math.abs(deltaY) < 1) return;
-
-    pendingChatGptScrollDeltaRef.current += deltaY;
-    if (chatGptScrollRafRef.current) return;
-
-    chatGptScrollRafRef.current = window.requestAnimationFrame(() => {
-      const delta = pendingChatGptScrollDeltaRef.current;
-      pendingChatGptScrollDeltaRef.current = 0;
-      chatGptScrollRafRef.current = undefined;
-      adapter.scrollConversationByDelta(delta);
-    });
   }
 
   useEffect(() => {
@@ -799,7 +1115,6 @@ function LiveAssistOverlay() {
       if (nextConversationId !== conversationIdRef.current) {
         conversationIdRef.current = nextConversationId;
         setConversationId(nextConversationId);
-        lastHydratedSignatureRef.current = "";
       }
     }, 700);
 
@@ -815,16 +1130,14 @@ function LiveAssistOverlay() {
       setLiveDocStatus("off");
       setLiveDocMessage("Not shared");
 
-      const storedMessages = await loadStoredChatMessages(conversationId);
+      const ledgerTurns = await loadTurnLedger(conversationId);
       if (cancelled) return;
 
-      if (storedMessages.length > 0) {
-        lastHydratedSignatureRef.current = chatHistorySignature(storedMessages);
-        engine.hydrateTurns(messagesToHydratedTurns(storedMessages));
-        debug(`Loaded stored chat history: ${storedMessages.length} messages`);
-      }
+      ledgerTurnsRef.current = ledgerTurns;
+      activeLedgerTurnIdRef.current = undefined;
+      hydrateEngineFromLedger(ledgerTurns);
+      debug(`Loaded local turn ledger: ${ledgerTurns.length} turns`);
 
-      await syncVisibleChatGptTurns("Synced visible ChatGPT turns");
       const storedScrollTop = await loadStoredScrollTop(conversationId);
       if (!cancelled && typeof storedScrollTop === "number") {
         savedDocScrollTopRef.current = storedScrollTop;
@@ -915,30 +1228,112 @@ function LiveAssistOverlay() {
     return adapter.observeLatestAnswer((answer) => {
       const activeRequest = activeRequestRef.current;
       if (!activeRequest) {
-        void syncVisibleChatGptTurns("ChatGPT answer synced");
         return;
       }
       if (answer.index < activeRequest.assistantStartCount && answer.text === activeRequest.ignoredAnswerText) return;
 
       const now = performance.now();
-      adapter.scrollConversationToRatio(1);
+      const requestKey = `${activeRequest.kind}:${activeRequest.turnId}`;
+      if (firstAnswerNotifiedForRequestRef.current !== requestKey) {
+        firstAnswerNotifiedForRequestRef.current = requestKey;
+        captureTimelineEvent("first answer", "ChatGPT response text detected");
+      }
       setLatency((current) => ({
         ...current,
         status: "streaming",
         firstAnswerAt: current.firstAnswerAt ?? now,
-        lastRenderAt: now
+        lastRenderAt: now,
+        checkpoints: {
+          ...current.checkpoints,
+          firstAssistantDomTextAt: current.checkpoints?.firstAssistantDomTextAt ?? now,
+          firstOverlayRenderAt: current.checkpoints?.firstOverlayRenderAt ?? now
+        }
       }));
-      engine.setAssistantAnswer(answer.text, answer.html);
+      if (activeRequest.kind === "starter") {
+        updateLedgerTurn(
+          activeRequest.turnId,
+          (turn) => ({
+            ...turn,
+            starter: answer.text,
+            status: "starter_streaming",
+            requestKind: "starter",
+            latency: {
+              ...turn.latency,
+              firstAnswerAt: turn.latency?.firstAnswerAt ?? now,
+              lastRenderAt: now,
+              checkpoints: {
+                ...turn.latency?.checkpoints,
+                firstAssistantDomTextAt: turn.latency?.checkpoints?.firstAssistantDomTextAt ?? now,
+                firstOverlayRenderAt: turn.latency?.checkpoints?.firstOverlayRenderAt ?? now
+              }
+            }
+          }),
+          { hydrate: false }
+        );
+        engine.setStarterAnswer(answer.text, activeRequest.turnId);
+      } else {
+        updateLedgerTurn(
+          activeRequest.turnId,
+          (turn) => ({
+            ...turn,
+            answer: answer.text,
+            answerHtml: answer.html,
+            status: "final_streaming",
+            requestKind: "final",
+            latency: {
+              ...turn.latency,
+              firstAnswerAt: turn.latency?.firstAnswerAt ?? now,
+              lastRenderAt: now,
+              checkpoints: {
+                ...turn.latency?.checkpoints,
+                firstAssistantDomTextAt: turn.latency?.checkpoints?.firstAssistantDomTextAt ?? now,
+                firstOverlayRenderAt: turn.latency?.checkpoints?.firstOverlayRenderAt ?? now
+              }
+            }
+          }),
+          { hydrate: false }
+        );
+        engine.setAssistantAnswer(answer.text, answer.html, activeRequest.turnId);
+      }
 
+      const stableDelayMs = activeRequest.kind === "starter" ? 650 : 1300;
       if (answerStableTimerRef.current) window.clearTimeout(answerStableTimerRef.current);
       answerStableTimerRef.current = window.setTimeout(() => {
+        const answerStableAt = performance.now();
         const hadQueuedFollowUp = stateRef.current.queuedQuestions.length > 0;
+        const completedRequest = activeRequestRef.current;
         activeRequestRef.current = null;
+        if (completedRequest) {
+          updateLedgerTurn(
+            completedRequest.turnId,
+            (turn) => ({
+              ...turn,
+              status: completedRequest.kind === "starter" ? "starter_done" : "done",
+              requestKind: completedRequest.kind,
+              latency: {
+                ...turn.latency,
+                lastRenderAt: answerStableAt,
+                checkpoints: {
+                  ...turn.latency?.checkpoints,
+                  answerStableAt
+                }
+              }
+            }),
+            { hydrate: false }
+          );
+          if (completedRequest.kind === "final" && activeLedgerTurnIdRef.current === completedRequest.turnId) {
+            activeLedgerTurnIdRef.current = undefined;
+          }
+        }
         engine.markIdle();
         setLatency((current) => ({
           ...current,
           status: "rendered",
-          lastRenderAt: performance.now()
+          lastRenderAt: answerStableAt,
+          checkpoints: {
+            ...current.checkpoints,
+            answerStableAt
+          }
         }));
         setStatusText("Answer rendered");
 
@@ -946,9 +1341,7 @@ function LiveAssistOverlay() {
           pendingFinalSendRef.current = false;
           pendingStarterQuestionRef.current = "";
           setStatusText("Starter rendered. Sending full answer prompt...");
-          window.setTimeout(() => {
-            void sendToChatGpt();
-          }, 120);
+          void sendToChatGpt();
         } else if (pendingStarterQuestionRef.current) {
           const nextStarterQuestion = pendingStarterQuestionRef.current;
           pendingStarterQuestionRef.current = "";
@@ -956,28 +1349,10 @@ function LiveAssistOverlay() {
           debug(`Held latest starter buffer locally: ${nextStarterQuestion.slice(0, 70)}`);
         } else if (hadQueuedFollowUp) {
           setStatusText("Sending queued follow-up to ChatGPT...");
-          window.setTimeout(() => {
-            void sendToChatGpt();
-          }, 120);
+          void sendToChatGpt();
         }
-      }, 1300);
+      }, stableDelayMs);
     });
-  }, [adapter, engine]);
-
-  useEffect(() => {
-    const hydrateIfIdle = () => {
-      if (activeRequestRef.current) return;
-      if (rollingQuestionRef.current.buffer.trim()) return;
-      void syncVisibleChatGptTurns("Visible ChatGPT turns synced");
-    };
-
-    const timeout = window.setTimeout(hydrateIfIdle, 400);
-    const interval = window.setInterval(hydrateIfIdle, 2500);
-
-    return () => {
-      window.clearTimeout(timeout);
-      window.clearInterval(interval);
-    };
   }, [adapter, engine]);
 
   useEffect(() => {
@@ -985,7 +1360,6 @@ function LiveAssistOverlay() {
 
     const interval = window.setInterval(() => {
       if (!latency.startedAt) return;
-      adapter.scrollConversationToRatio(1);
       setElapsedMs(performance.now() - latency.startedAt);
     }, 100);
 
@@ -1021,22 +1395,15 @@ function LiveAssistOverlay() {
 
     const handleScroll = () => {
       if (performance.now() < silentDocScrollUntilRef.current) return;
-      const delta = updateAutoFollowFromManualScroll();
+      updateAutoFollowFromManualScroll();
       scheduleSaveDocScrollTop();
       updateActiveMarkerFromScroll();
-      syncChatGptScrollByDelta(delta);
-      window.setTimeout(() => {
-        if (!activeRequestRef.current) void syncVisibleChatGptTurns("Scroll discovered ChatGPT turns");
-      }, 180);
     };
 
     scroll.addEventListener("scroll", handleScroll, { passive: true });
 
     return () => {
       scroll.removeEventListener("scroll", handleScroll);
-      if (chatGptScrollRafRef.current) window.cancelAnimationFrame(chatGptScrollRafRef.current);
-      chatGptScrollRafRef.current = undefined;
-      pendingChatGptScrollDeltaRef.current = 0;
     };
   }, [isOpen]);
 
@@ -1044,8 +1411,8 @@ function LiveAssistOverlay() {
     return () => {
       if (flowDebounceRef.current) window.clearTimeout(flowDebounceRef.current);
       if (answerStableTimerRef.current) window.clearTimeout(answerStableTimerRef.current);
-      if (chatGptScrollRafRef.current) window.cancelAnimationFrame(chatGptScrollRafRef.current);
       if (saveScrollTimerRef.current) window.clearTimeout(saveScrollTimerRef.current);
+      if (realtimeStarterTimerRef.current) window.clearTimeout(realtimeStarterTimerRef.current);
     };
   }, []);
 
@@ -1140,9 +1507,16 @@ function LiveAssistOverlay() {
     if (event.type === "capture_started") {
       setNativeStatus("capturing");
       nativeStatusRef.current = "capturing";
+      captureTimelineEvent("listening", "Realtime capture started");
       setRollingQuestion(createEmptyRollingQuestion(event.sessionId));
+      rollingQuestionRef.current = createEmptyRollingQuestion(event.sessionId);
+      realtimeCaptureStartedAtRef.current = Date.now();
+      if (realtimeStarterTimerRef.current) window.clearTimeout(realtimeStarterTimerRef.current);
+      realtimeStarterTimerRef.current = undefined;
+      activeLedgerTurnIdRef.current = undefined;
       setTypedText("");
-      setStatusText("Rolling capture started.");
+      engine.clearPartialTranscript();
+      setStatusText("Always listening. Fn sends, Control gets starter, long-hold Fn stops.");
       return;
     }
 
@@ -1153,6 +1527,41 @@ function LiveAssistOverlay() {
       return;
     }
 
+    if (event.type === "transcript_delta") {
+      setNativeStatus("capturing");
+      nativeStatusRef.current = "capturing";
+      captureTimelineEvent("transcript received");
+      const text = event.text?.trim() || "";
+      if (!text) return;
+
+      const next: RollingQuestionState = {
+        sessionId: event.sessionId || rollingQuestionRef.current.sessionId,
+        chunks: [
+          {
+            chunkId: event.chunkId || `realtime-${Date.now()}`,
+            text,
+            completedAt: event.completedAt || Date.now()
+          }
+        ],
+        buffer: text,
+        starter: rollingQuestionRef.current.starter
+      };
+      rollingQuestionRef.current = next;
+      setRollingQuestion(next);
+      engine.ingestPartial("interviewer", next.buffer, starterMode);
+      if (activeLedgerTurnIdRef.current && !activeRequestRef.current) {
+        updateLedgerTurn(
+          activeLedgerTurnIdRef.current,
+          (turn) => ({ ...turn, question: next.buffer }),
+          { hydrate: true }
+        );
+      }
+
+      setTypedText("");
+      setStatusText(starterPolicyRef.current.sentCount > 0 ? "Listening. Starter ready for this question." : "Listening. Press Fn to send or Control for starter.");
+      return;
+    }
+
     if (event.type === "chunk_transcribed" || event.type === "starter_updated") {
       setNativeStatus("capturing");
       nativeStatusRef.current = "capturing";
@@ -1160,9 +1569,6 @@ function LiveAssistOverlay() {
         const next = event.type === "chunk_transcribed" ? appendTranscriptChunk(current, event) : { ...current, starter: event.starter || current.starter };
         if (next.buffer) {
           engine.ingestPartial("interviewer", next.buffer, starterMode);
-          if (event.type === "chunk_transcribed") {
-            void maybeSendStarterToChatGpt(next.buffer);
-          }
         }
         return next;
       });
@@ -1175,15 +1581,60 @@ function LiveAssistOverlay() {
       return;
     }
 
+    if (event.type === "starter_requested") {
+      const question = rollingQuestionRef.current.buffer.trim();
+      if (!question) {
+        setStatusText("No live question captured yet.");
+        return;
+      }
+      void maybeSendStarterToChatGpt(question);
+      return;
+    }
+
     if (event.type === "question_finalized") {
+      const eventReceivedAt = performance.now();
+      const dictaraFinalTextAt = eventReceivedAt;
+      setLatencyCheckpoint("extensionEventReceivedAt", eventReceivedAt);
+      setLatencyCheckpoint("dictaraFinalTextAt", dictaraFinalTextAt);
+      captureTimelineEvent("flushed", "Final question received from Dictara");
+      const keepListening = nativeStatusRef.current === "capturing";
+      if (realtimeStarterTimerRef.current) {
+        window.clearTimeout(realtimeStarterTimerRef.current);
+        realtimeStarterTimerRef.current = undefined;
+      }
+      if (!keepListening) realtimeCaptureStartedAtRef.current = undefined;
+      setNativeStatus(keepListening ? "capturing" : "connected");
+      nativeStatusRef.current = keepListening ? "capturing" : "connected";
       const question = event.text?.trim();
       if (!question) {
         setStatusText("No question text captured yet.");
         return;
       }
 
+      starterSentRef.current = false;
+      pendingStarterQuestionRef.current = "";
+      lastStarterQuestionSentRef.current = "";
+      const turn = ensureLedgerTurn(question);
       engine.finalizeActiveInterviewerQuestion(question, starterMode);
-      setRollingQuestion(createEmptyRollingQuestion(event.sessionId));
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          question,
+          latency: {
+            ...current.latency,
+            checkpoints: {
+              ...current.latency?.checkpoints,
+              dictaraFinalTextAt,
+              extensionEventReceivedAt: eventReceivedAt
+            }
+          }
+        }),
+        { hydrate: false }
+      );
+      const emptyQuestion = createEmptyRollingQuestion(event.sessionId);
+      setRollingQuestion(emptyQuestion);
+      rollingQuestionRef.current = emptyQuestion;
       starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
       pendingStarterQuestionRef.current = "";
 
@@ -1192,23 +1643,76 @@ function LiveAssistOverlay() {
         setStatusText("Question finalized. Waiting for starter before full answer...");
       } else {
         setStatusText("Question finalized. Sending full answer to ChatGPT...");
-        window.setTimeout(() => {
-          void sendToChatGpt();
-        }, 80);
+        void sendToChatGpt();
       }
       return;
     }
 
+    if (event.type === "buffer_cleared") {
+      if (realtimeStarterTimerRef.current) {
+        window.clearTimeout(realtimeStarterTimerRef.current);
+        realtimeStarterTimerRef.current = undefined;
+      }
+      setRollingQuestion(createEmptyRollingQuestion(event.sessionId));
+      rollingQuestionRef.current = createEmptyRollingQuestion(event.sessionId);
+      starterSentRef.current = false;
+      starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
+      pendingStarterQuestionRef.current = "";
+      lastStarterQuestionSentRef.current = "";
+      activeLedgerTurnIdRef.current = undefined;
+      engine.clearPartialTranscript();
+      setTypedText("");
+      captureTimelineEvent("cleared", "Live question buffer cleared");
+      setStatusText("Live buffer cleared. Still listening.");
+      return;
+    }
+
+    if (event.type === "realtime_reconnecting") {
+      setNativeStatus("transcribing");
+      nativeStatusRef.current = "transcribing";
+      captureTimelineEvent("reconnecting", event.error || "Realtime reconnecting");
+      setStatusText("Realtime reconnecting...");
+      return;
+    }
+
+    if (event.type === "realtime_reconnected") {
+      setNativeStatus("capturing");
+      nativeStatusRef.current = "capturing";
+      captureTimelineEvent("connected", "Realtime transcription reconnected");
+      setStatusText("Realtime reconnected. Still listening.");
+      return;
+    }
+
+    if (event.type === "realtime_failed") {
+      setNativeStatus("error");
+      nativeStatusRef.current = "error";
+      captureTimelineEvent("error", event.error || "Realtime failed");
+      setStatusText(event.error || "Realtime transcription failed.");
+      return;
+    }
+
     if (event.type === "capture_stopped") {
+      if (realtimeStarterTimerRef.current) {
+        window.clearTimeout(realtimeStarterTimerRef.current);
+        realtimeStarterTimerRef.current = undefined;
+      }
+      realtimeCaptureStartedAtRef.current = undefined;
       setNativeStatus("connected");
       nativeStatusRef.current = "connected";
+      captureTimelineEvent("stopped", "Realtime capture stopped");
       setStatusText("Rolling capture stopped.");
       return;
     }
 
     if (event.type === "transcription_error") {
+      if (realtimeStarterTimerRef.current) {
+        window.clearTimeout(realtimeStarterTimerRef.current);
+        realtimeStarterTimerRef.current = undefined;
+      }
+      realtimeCaptureStartedAtRef.current = undefined;
       setNativeStatus("error");
       nativeStatusRef.current = "error";
+      captureTimelineEvent("error", event.error || "Native transcription failed");
       setStatusText(event.error || "Native transcription failed.");
     }
   }
@@ -1264,14 +1768,15 @@ function LiveAssistOverlay() {
     if (!isVoiceCapture) return;
 
     const hasFinalizeMarker = value.includes(LIVE_ASSIST_FINALIZE_MARKER);
+    if (!hasFinalizeMarker && !finalizeAfterNextChunkRef.current) return;
+
     const text = extractNewDictaraText(value);
     if (!text && !hasFinalizeMarker) return;
 
     setStatusText("Dictara pasted a chunk. Adding it to the rolling question...");
     debug(`Dictara paste input: ${text.slice(0, 70)}`);
 
-    if (flowDebounceRef.current) window.clearTimeout(flowDebounceRef.current);
-    flowDebounceRef.current = window.setTimeout(() => {
+    const processDictaraPaste = () => {
       const rawChunkText = captureTextareaRef.current?.value || "";
       const shouldFinalize = rawChunkText.includes(LIVE_ASSIST_FINALIZE_MARKER) || finalizeAfterNextChunkRef.current;
       const chunkText = extractNewDictaraText(rawChunkText);
@@ -1279,24 +1784,20 @@ function LiveAssistOverlay() {
         if (shouldFinalize) {
           setTypedText("");
           finalizeAfterNextChunkRef.current = false;
-          window.setTimeout(() => {
-            finalizeRollingPasteQuestion();
-          }, 80);
+          finalizeRollingPasteQuestion();
         }
         return;
       }
 
       lastFlowSubmittedRef.current = chunkText;
-      appendRollingPasteChunk(chunkText);
+      appendRollingPasteChunk(chunkText, { skipStarter: shouldFinalize });
       setTypedText("");
       setStatusText(shouldFinalize ? "Final Dictara chunk added. Sending..." : "Dictara chunk added. Continue speaking or press Finalize.");
       debug(`Dictara chunk added as ${typedRole}: ${chunkText.slice(0, 70)}`);
 
       if (shouldFinalize) {
         finalizeAfterNextChunkRef.current = false;
-        window.setTimeout(() => {
-          finalizeRollingPasteQuestion();
-        }, 80);
+        finalizeRollingPasteQuestion();
       }
 
       if (isVoiceCapture) {
@@ -1307,10 +1808,20 @@ function LiveAssistOverlay() {
           textarea?.setSelectionRange(end, end);
         }, 120);
       }
-    }, 350);
+    };
+
+    if (hasFinalizeMarker || finalizeAfterNextChunkRef.current) {
+      if (flowDebounceRef.current) window.clearTimeout(flowDebounceRef.current);
+      flowDebounceRef.current = undefined;
+      queueMicrotask(processDictaraPaste);
+      return;
+    }
+
+    if (flowDebounceRef.current) window.clearTimeout(flowDebounceRef.current);
+    flowDebounceRef.current = window.setTimeout(processDictaraPaste, 150);
   }
 
-  function appendRollingPasteChunk(text: string) {
+  function appendRollingPasteChunk(text: string, options: { skipStarter?: boolean } = {}) {
     const event: HelperEvent = {
       type: "chunk_transcribed",
       sessionId: rollingQuestionRef.current.sessionId || `dictara-paste-${Date.now()}`,
@@ -1327,7 +1838,7 @@ function LiveAssistOverlay() {
 
     if (next.buffer) {
       engine.ingestPartial(typedRole, next.buffer, starterMode);
-      if (typedRole === "interviewer") {
+      if (typedRole === "interviewer" && !options.skipStarter) {
         void maybeSendStarterToChatGpt(next.buffer);
       }
     }
@@ -1353,6 +1864,7 @@ function LiveAssistOverlay() {
     starterSentRef.current = true;
     starterPolicyRef.current.sentCount += 1;
     lastStarterQuestionSentRef.current = normalizedQuestion;
+    const promptBuildStartedAt = performance.now();
     const prompt = engine.buildStarterPromptForQuestion(normalizedQuestion);
     if (!prompt.ok) {
       starterSentRef.current = false;
@@ -1375,21 +1887,58 @@ function LiveAssistOverlay() {
       const startedAt = performance.now();
       const assistantStartCount = adapter.assistantCount();
       const ignoredAnswerText = latestAssistantText();
+      const turn = ensureLedgerTurn(prompt.question);
       activeRequestRef.current = {
+        turnId: turn.id,
         question: prompt.question,
         assistantStartCount,
         kind: "starter",
         ignoredAnswerText
       };
+      firstAnswerNotifiedForRequestRef.current = undefined;
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          question: prompt.question,
+          status: "starter_waiting",
+          requestKind: "starter",
+          latency: {
+            ...current.latency,
+            startedAt,
+            checkpoints: {
+              ...current.latency?.checkpoints,
+              promptBuildStartedAt
+            }
+          }
+        }),
+        { hydrate: true }
+      );
       setElapsedMs(0);
-      setLatency({ status: "waiting", startedAt });
-      engine.markGeneratingStarter(prompt.question);
+      setLatency({ status: "waiting", startedAt, checkpoints: { promptBuildStartedAt } });
+      engine.markGeneratingStarter(prompt.question, turn.id);
       setStatusText("Sending starter to ChatGPT...");
-      await adapter.sendPrompt(prompt.prompt);
-      setLatency((current) => ({ ...current, submittedAt: performance.now() }));
+      await adapter.sendPrompt(prompt.prompt, chatGptSendTimings(turn.id));
+      const submittedAt = performance.now();
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          latency: {
+            ...current.latency,
+            submittedAt
+          }
+        }),
+        { hydrate: false }
+      );
+      setLatency((current) => ({ ...current, submittedAt }));
       setStatusText("Starter prompt sent to ChatGPT");
     } catch (error) {
+      const failedRequest = activeRequestRef.current;
       activeRequestRef.current = null;
+      if (failedRequest) {
+        updateLedgerTurn(failedRequest.turnId, (turn) => ({ ...turn, status: "send_failed", error: error instanceof Error ? error.message : "Unable to send starter prompt" }), { hydrate: true });
+      }
       starterSentRef.current = false;
       starterPolicyRef.current.sentCount = Math.max(0, starterPolicyRef.current.sentCount - 1);
       lastStarterQuestionSentRef.current = "";
@@ -1409,7 +1958,7 @@ function LiveAssistOverlay() {
     const pendingText = isVoiceCapture ? extractNewDictaraText(rawPendingText) : rawPendingText;
     if (pendingText && pendingText !== lastFlowSubmittedRef.current) {
       lastFlowSubmittedRef.current = pendingText;
-      appendRollingPasteChunk(pendingText);
+      appendRollingPasteChunk(pendingText, { skipStarter: true });
     }
 
     const question = rollingQuestionRef.current.buffer.trim();
@@ -1419,7 +1968,17 @@ function LiveAssistOverlay() {
     }
 
     if (typedRole === "interviewer") {
+      const turn = ensureLedgerTurn(question);
       engine.finalizeActiveInterviewerQuestion(question, starterMode);
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          question,
+          status: activeRequestRef.current?.kind === "starter" ? current.status : "draft"
+        }),
+        { hydrate: false }
+      );
     } else {
       engine.ingestFinal(typedRole, question, starterMode);
     }
@@ -1440,9 +1999,7 @@ function LiveAssistOverlay() {
         pendingFinalSendRef.current = true;
         setStatusText("Final question ready. Waiting for starter response to finish...");
       } else {
-        window.setTimeout(() => {
-          void sendToChatGpt();
-        }, 80);
+        void sendToChatGpt();
       }
     }
   }
@@ -1543,6 +2100,7 @@ function LiveAssistOverlay() {
     debug("Send clicked");
     setStatusText("Preparing prompt...");
 
+    const promptBuildStartedAt = performance.now();
     const prompt = engine.buildPromptForCurrentQuestion();
     if (!prompt.ok) {
       setStatusText(prompt.reason);
@@ -1562,21 +2120,58 @@ function LiveAssistOverlay() {
       const startedAt = performance.now();
       const assistantStartCount = adapter.assistantCount();
       const ignoredAnswerText = latestAssistantText();
+      const turn = ensureLedgerTurn(prompt.question);
       activeRequestRef.current = {
+        turnId: turn.id,
         question: prompt.question,
         assistantStartCount,
         kind: "final",
         ignoredAnswerText
       };
+      firstAnswerNotifiedForRequestRef.current = undefined;
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          question: prompt.question,
+          status: "final_waiting",
+          requestKind: "final",
+          latency: {
+            ...current.latency,
+            startedAt,
+            checkpoints: {
+              ...current.latency?.checkpoints,
+              promptBuildStartedAt
+            }
+          }
+        }),
+        { hydrate: true }
+      );
       setElapsedMs(0);
-      setLatency({ status: "waiting", startedAt });
-      engine.markGenerating(prompt.question);
-      await adapter.sendPrompt(prompt.prompt);
-      setLatency((current) => ({ ...current, submittedAt: performance.now() }));
+      setLatency({ status: "waiting", startedAt, checkpoints: { promptBuildStartedAt } });
+      engine.markGenerating(prompt.question, turn.id);
+      await adapter.sendPrompt(prompt.prompt, chatGptSendTimings(turn.id));
+      const submittedAt = performance.now();
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          latency: {
+            ...current.latency,
+            submittedAt
+          }
+        }),
+        { hydrate: false }
+      );
+      setLatency((current) => ({ ...current, submittedAt }));
       setStatusText("Prompt sent to ChatGPT");
       debug("Prompt sent to ChatGPT");
     } catch (error) {
+      const failedRequest = activeRequestRef.current;
       activeRequestRef.current = null;
+      if (failedRequest) {
+        updateLedgerTurn(failedRequest.turnId, (turn) => ({ ...turn, status: "send_failed", error: error instanceof Error ? error.message : "Unable to send prompt" }), { hydrate: true });
+      }
       engine.markIdle();
       debug(`Send exception: ${error instanceof Error ? error.message : String(error)}`);
       setStatusText(error instanceof Error ? error.message : "Unable to send prompt");
@@ -1636,7 +2231,7 @@ function LiveAssistOverlay() {
     const values = {
       partialQuestion: rollingQuestion.buffer || state.partialTranscript?.text || "Can you walk me through how you would debug this login issue?",
       currentQuestion: state.currentQuestion || rollingQuestion.buffer || "Can you walk me through how you would debug this login issue?",
-      starter: state.provisionalStarter?.text || "That’s a good question. I’d start by clarifying the main constraint and then work through the likely failure points.",
+      starter: state.provisionalStarter?.text || "",
       candidateSpeech: state.lastCandidateSpeech || "Not captured yet."
     };
 
@@ -1647,20 +2242,95 @@ function LiveAssistOverlay() {
   }
 
   function footerSubmit() {
-    setStatusText("Manual send is disabled for now. Dictara finalize still sends automatically.");
-    debug("Manual bottom send ignored");
+    const value = typedText.trim();
+    if (!value) {
+      setStatusText("Type a question first.");
+      return;
+    }
+
+    void sendManualTextToChatGpt(value);
+  }
+
+  async function sendManualTextToChatGpt(text: string) {
+    const question = text.trim();
+    if (!question) return;
+
+    const connectionState = adapter.checkConnection();
+    setConnection(connectionState);
+    if (connectionState.status !== "connected") {
+      setStatusText(connectionState.message || "ChatGPT page connection lost.");
+      return;
+    }
+
+    const turn = ensureLedgerTurn(question);
+    const promptBuildStartedAt = performance.now();
+    updateLedgerTurn(
+      turn.id,
+      (current) => ({
+        ...current,
+        question,
+        status: "final_waiting",
+        requestKind: "final",
+        latency: {
+          ...current.latency,
+          startedAt: promptBuildStartedAt,
+          checkpoints: {
+            ...current.latency?.checkpoints,
+            promptBuildStartedAt
+          }
+        }
+      }),
+      { hydrate: true }
+    );
+
+    try {
+      const startedAt = performance.now();
+      const assistantStartCount = adapter.assistantCount();
+      const ignoredAnswerText = latestAssistantText();
+      activeRequestRef.current = {
+        turnId: turn.id,
+        question,
+        assistantStartCount,
+        kind: "final",
+        ignoredAnswerText
+      };
+      firstAnswerNotifiedForRequestRef.current = undefined;
+      setTypedText("");
+      setElapsedMs(0);
+      setLatency({ status: "waiting", startedAt, checkpoints: { promptBuildStartedAt } });
+      engine.markGenerating(question, turn.id);
+      setStatusText("Sending direct message to ChatGPT...");
+      await adapter.sendPrompt(question, chatGptSendTimings(turn.id));
+      const submittedAt = performance.now();
+      updateLedgerTurn(
+        turn.id,
+        (current) => ({
+          ...current,
+          latency: {
+            ...current.latency,
+            submittedAt
+          }
+        }),
+        { hydrate: false }
+      );
+      setLatency((current) => ({ ...current, submittedAt }));
+      setStatusText("Direct message sent to ChatGPT");
+      debug("Manual direct message sent to ChatGPT");
+    } catch (error) {
+      activeRequestRef.current = null;
+      updateLedgerTurn(turn.id, (current) => ({ ...current, status: "send_failed", error: error instanceof Error ? error.message : "Unable to send direct message" }), { hydrate: true });
+      engine.markIdle();
+      setStatusText(error instanceof Error ? error.message : "Unable to send direct message");
+      debug(`Manual direct send exception: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   function captureDisplayValue() {
-    if (isVoiceCapture && rollingQuestion.buffer.trim()) {
-      return typedText.trim() ? typedText : rollingQuestion.buffer;
-    }
-
     return typedText;
   }
 
   function extractNewDictaraText(rawValue: string) {
-    const withoutMarker = rawValue.replace(LIVE_ASSIST_FINALIZE_MARKER, "").trim();
+    const withoutMarker = rawValue.replaceAll(LIVE_ASSIST_FINALIZE_MARKER, "").trim();
     const currentBuffer = rollingQuestionRef.current.buffer.trim();
 
     if (!currentBuffer || !withoutMarker.startsWith(currentBuffer)) {
@@ -1673,8 +2343,10 @@ function LiveAssistOverlay() {
   function clearSession() {
     engine.reset();
     starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
+    ledgerTurnsRef.current = [];
+    activeLedgerTurnIdRef.current = undefined;
     void clearStoredChatTurns(conversationIdRef.current);
-    lastHydratedSignatureRef.current = "";
+    void clearTurnLedger(conversationIdRef.current);
     setStatusText("Session cleared");
     debug("Session cleared");
   }
@@ -1746,6 +2418,7 @@ function LiveAssistOverlay() {
     liveDocStatus
   });
   const visibleTurns = state.turns;
+  const liveQuestionText = rollingQuestion.buffer.trim();
 
   return (
     <section className={`gptd-shell ${readerTheme}`} aria-label="GPTDisguise interview reader">
@@ -1781,6 +2454,7 @@ function LiveAssistOverlay() {
         />
 
         <LatencyPill latency={latency} elapsedMs={elapsedMs} />
+        <LatencyDetails latency={latency} />
         <button className={liveDocSession ? "gptd-top-action active" : "gptd-top-action"} onClick={() => void shareLiveDocSession()} title={liveDocSession?.viewUrl || liveDocMessage}>
           <Share2 size={14} />
           {liveDocSession ? "Copy link" : "Share session"}
@@ -1796,11 +2470,10 @@ function LiveAssistOverlay() {
 
       <main className="gptd-reader-scroll" ref={docScrollRef}>
         <section className={`gptd-reader-content ${readerViewMode}`}>
-          {visibleTurns.length === 0 && !state.partialTranscript ? (
+          {visibleTurns.length === 0 ? (
             <div className="gptd-empty">Waiting for the next question...</div>
           ) : (
             <>
-              {state.partialTranscript && <PartialTranscript event={state.partialTranscript} starter={state.provisionalStarter?.text} />}
               <TurnCards turns={visibleTurns} activeTurnId={state.activeTurnId} phase={state.phase} viewMode={readerViewMode} />
               {state.queuedQuestions.length > 0 && (
                 <div className="gptd-queue">
@@ -1815,6 +2488,13 @@ function LiveAssistOverlay() {
         </section>
         <QuestionMarkerRail turns={visibleTurns} activeIndex={activeMarkerIndex} onSelect={scrollToTurn} />
       </main>
+
+      <NextQuestionPanel
+        question={liveQuestionText}
+        starter={state.provisionalStarter?.text}
+        nativeStatus={nativeStatus}
+        timeline={captureTimeline}
+      />
 
       <footer className="gptd-compose">
         <div className="gptd-compose-inner">
@@ -1840,7 +2520,7 @@ function LiveAssistOverlay() {
               if (event.key === "Enter" && !event.shiftKey) event.preventDefault();
             }}
           />
-          <button className="gptd-send-button" onClick={footerSubmit} disabled>
+          <button className="gptd-send-button" onClick={footerSubmit} disabled={!typedText.trim() || latency.status === "waiting" || latency.status === "streaming"}>
             Send
           </button>
         </div>
@@ -2280,9 +2960,42 @@ function LatencyPill({ latency, elapsedMs }: { latency: LatencyState; elapsedMs:
   return <span className="gptd-latency rendered">Rendered {formatSeconds(totalMs)} · first {formatSeconds(firstMs)}</span>;
 }
 
+function LatencyDetails({ latency }: { latency: LatencyState }) {
+  const checkpoints = latency.checkpoints || {};
+  const rows = [
+    ["Dictara final text", checkpoints.dictaraFinalTextAt],
+    ["Extension received", checkpoints.extensionEventReceivedAt],
+    ["Prompt build", checkpoints.promptBuildStartedAt],
+    ["Composer start", checkpoints.composerInsertStartedAt],
+    ["Composer ready", checkpoints.composerInsertCompletedAt],
+    ["Send click", checkpoints.sendClickedAt],
+    ["First answer", latency.firstAnswerAt],
+    ["Rendered", latency.lastRenderAt]
+  ] as const;
+
+  return (
+    <details className="gptd-latency-details">
+      <summary>Timing</summary>
+      <div>
+        {rows.map(([label, value]) => (
+          <span key={label}>
+            <strong>{label}</strong>
+            <em>{formatRelativeTiming(value, latency.startedAt)}</em>
+          </span>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 function formatSeconds(ms?: number) {
   if (typeof ms !== "number" || Number.isNaN(ms)) return "--";
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatRelativeTiming(value?: number, startedAt?: number) {
+  if (typeof value !== "number" || typeof startedAt !== "number") return "--";
+  return `+${formatSeconds(value - startedAt)}`;
 }
 
 function useTypewriterText(target: string, active: boolean) {
@@ -2306,9 +3019,11 @@ function useTypewriterText(target: string, active: boolean) {
 
     const timer = window.setTimeout(() => {
       setDisplayed((current) => {
-        return target.slice(0, current.length + 1);
+        const remaining = target.length - current.length;
+        const step = Math.max(2, Math.min(96, Math.ceil(remaining / 6)));
+        return target.slice(0, current.length + step);
       });
-    }, 42);
+    }, 16);
 
     return () => window.clearTimeout(timer);
   }, [active, displayed, target]);
@@ -2334,6 +3049,91 @@ function PartialTranscript({ event, starter }: { event: ConversationEvent; start
         </div>
       )}
     </div>
+  );
+}
+
+function NextQuestionPanel({
+  question,
+  starter,
+  nativeStatus,
+  timeline
+}: {
+  question: string;
+  starter?: string;
+  nativeStatus: NativeBridgeStatus;
+  timeline: CaptureTimelineEntry[];
+}) {
+  const displayQuestion = useTypewriterText(question, Boolean(question));
+  const isTypingQuestion = displayQuestion.length < question.length;
+  const hasQuestion = Boolean(question.trim());
+
+  return (
+    <aside className={["gptd-next-question", hasQuestion ? "active" : "", nativeStatus].filter(Boolean).join(" ")}>
+      <div className="gptd-next-question-header">
+        <span>Next question</span>
+        <strong>{hasQuestion ? "capturing" : nativeStatus === "capturing" ? "listening" : nativeStatus}</strong>
+      </div>
+      {hasQuestion ? (
+        <p>{displayQuestion}{isTypingQuestion && <span className="gptd-type-caret" />}</p>
+      ) : (
+        <p className="gptd-muted">Live transcript will appear here while the current answer stays readable.</p>
+      )}
+      {starter && (
+        <div className="gptd-starter compact">
+          <span>Starter</span>
+          <p>{starter}</p>
+        </div>
+      )}
+      {timeline.length > 0 && (
+        <details className="gptd-capture-timeline">
+          <summary>Capture timeline</summary>
+          {timeline.map((entry) => (
+            <div key={entry.id}>
+              <span>{entry.createdAt}</span>
+              <strong>{entry.label}</strong>
+              {entry.detail && <em>{entry.detail}</em>}
+            </div>
+          ))}
+        </details>
+      )}
+    </aside>
+  );
+}
+
+function DraftQuestionCard({
+  question,
+  starter,
+  index,
+  viewMode
+}: {
+  question: string;
+  starter?: string;
+  index: number;
+  viewMode: ReaderViewMode;
+}) {
+  const displayQuestion = useTypewriterText(question, true);
+  const isTypingQuestion = displayQuestion.length < question.length;
+
+  return (
+    <article className={["gptd-turn", viewMode, "active", "latest", "draft"].filter(Boolean).join(" ")}>
+      <div className="gptd-turn-label">Current question {index + 1}</div>
+      <section className="gptd-question-band">
+        <div className="gptd-question-body">
+          <div className="gptd-question-content">
+            <p>{displayQuestion}{isTypingQuestion && <span className="gptd-type-caret" />}</p>
+          </div>
+        </div>
+      </section>
+      {starter && (
+        <div className="gptd-starter compact">
+          <span>Starter</span>
+          <p>{starter}</p>
+        </div>
+      )}
+      <section className="gptd-answer-band">
+        <p className="gptd-muted">Listening. Press Fn to send, Control for starter, long-hold Fn to stop.</p>
+      </section>
+    </article>
   );
 }
 
@@ -2397,7 +3197,8 @@ function TurnCard({
 }) {
   const isAnswering = isActive && phase === "generating" && !turn.answer;
   const hasLongQuestion = turn.question.length > 260 || Boolean(turn.questionImages?.length) || Boolean(turn.questionFiles?.length);
-  const displayAnswer = useTypewriterText(turn.answer || "", isActive && Boolean(turn.answer));
+  const shouldAnimateAnswer = isActive && phase === "generating" && Boolean(turn.answer);
+  const displayAnswer = useTypewriterText(turn.answer || "", shouldAnimateAnswer);
   const isTypingAnswer = displayAnswer.length < (turn.answer || "").length;
   const showRichAnswer = Boolean(turn.answerHtml) && !isTypingAnswer;
 
@@ -2407,7 +3208,8 @@ function TurnCard({
         "gptd-turn",
         viewMode,
         isActive ? "active" : "",
-        isLatest ? "latest" : ""
+        isLatest ? "latest" : "",
+        !isLatest && !isActive ? "historical" : ""
       ].filter(Boolean).join(" ")}
     >
       <div className="gptd-turn-label">Question {index + 1}</div>

@@ -135,6 +135,22 @@ impl KeyListener {
             EventType::KeyPress(key) => {
                 let keycode = key.to_macos_keycode();
 
+                if live_assist_realtime_enabled() {
+                    pressed_keys.insert(keycode);
+                    if handle_realtime_live_assist_keypress(
+                        keycode,
+                        command_tx,
+                        state_manager,
+                        rolling_active,
+                        rolling_hands_free,
+                        fn_key_down,
+                        fn_stop_consumed,
+                    ) {
+                        return None;
+                    }
+                    return Some(event);
+                }
+
                 if keycode == FN_KEYCODE {
                     pressed_keys.insert(keycode);
                     handle_fn_press(
@@ -205,6 +221,23 @@ impl KeyListener {
             }
             EventType::KeyRelease(key) => {
                 let keycode = key.to_macos_keycode();
+
+                if live_assist_realtime_enabled() {
+                    pressed_keys.remove(&keycode);
+                    if keycode == FN_KEYCODE {
+                        handle_realtime_live_assist_keyrelease(
+                            command_tx,
+                            rolling_active,
+                            fn_key_down,
+                            fn_stop_consumed,
+                        );
+                        return None;
+                    }
+                    if is_control_key(keycode) {
+                        return None;
+                    }
+                    return Some(event);
+                }
 
                 if keycode == FN_KEYCODE {
                     pressed_keys.remove(&keycode);
@@ -312,10 +345,99 @@ impl KeyListener {
 }
 
 const FN_KEYCODE: u32 = 63;
+const SPACE_KEYCODE: u32 = 49;
+const LEFT_CONTROL_KEYCODE: u32 = 59;
+const RIGHT_CONTROL_KEYCODE: u32 = 62;
 const LIVE_ASSIST_FIRST_CHUNK_SECONDS: u64 = 10;
 const LIVE_ASSIST_FOLLOWUP_CHUNK_SECONDS: u64 = 5;
 const FN_HOLD_TO_RECORD_MS: u64 = 320;
 const FN_DOUBLE_TAP_MS: u64 = 380;
+const REALTIME_FN_HOLD_TOGGLE_MS: u64 = 650;
+
+fn handle_realtime_live_assist_keypress(
+    keycode: u32,
+    command_tx: &mpsc::Sender<RecordingCommand>,
+    state_manager: &Arc<RecordingStateManager>,
+    rolling_active: &Arc<AtomicBool>,
+    rolling_hands_free: &Arc<AtomicBool>,
+    fn_key_down: &Arc<AtomicBool>,
+    fn_stop_consumed: &Arc<AtomicBool>,
+) -> bool {
+    if keycode == FN_KEYCODE {
+        if fn_key_down.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+
+        fn_stop_consumed.store(false, Ordering::SeqCst);
+        let hold_tx = command_tx.clone();
+        let hold_state_manager = state_manager.clone();
+        let hold_rolling_active = rolling_active.clone();
+        let hold_rolling_hands_free = rolling_hands_free.clone();
+        let hold_fn_key_down = fn_key_down.clone();
+        let hold_fn_consumed = fn_stop_consumed.clone();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(REALTIME_FN_HOLD_TOGGLE_MS));
+            if !hold_fn_key_down.load(Ordering::SeqCst) {
+                return;
+            }
+
+            hold_fn_consumed.store(true, Ordering::SeqCst);
+            if hold_rolling_active.swap(false, Ordering::SeqCst) {
+                info!("Live Assist realtime always-listen stopped by Fn hold");
+                hold_rolling_hands_free.store(false, Ordering::SeqCst);
+                let _ = hold_tx.blocking_send(RecordingCommand::Cancel);
+            } else {
+                info!("Live Assist realtime always-listen started by Fn hold");
+                start_live_assist_rolling(
+                    &hold_tx,
+                    &hold_state_manager,
+                    &hold_rolling_active,
+                    &hold_rolling_hands_free,
+                    true,
+                );
+            }
+        });
+
+        return true;
+    }
+
+    if is_control_key(keycode) && rolling_active.load(Ordering::SeqCst) {
+        info!("Live Assist realtime starter requested by Control");
+        let _ = command_tx.blocking_send(RecordingCommand::RequestRealtimeStarter);
+        return true;
+    }
+
+    if keycode == SPACE_KEYCODE && rolling_active.load(Ordering::SeqCst) {
+        info!("Live Assist realtime buffer cleared by Space");
+        let _ = command_tx.blocking_send(RecordingCommand::ClearRealtimeBuffer);
+        return true;
+    }
+
+    false
+}
+
+fn handle_realtime_live_assist_keyrelease(
+    command_tx: &mpsc::Sender<RecordingCommand>,
+    rolling_active: &Arc<AtomicBool>,
+    fn_key_down: &Arc<AtomicBool>,
+    fn_stop_consumed: &Arc<AtomicBool>,
+) {
+    fn_key_down.store(false, Ordering::SeqCst);
+
+    if fn_stop_consumed.swap(false, Ordering::SeqCst) {
+        return;
+    }
+
+    if rolling_active.load(Ordering::SeqCst) {
+        info!("Live Assist realtime buffer finalized by Fn tap");
+        let _ = command_tx.blocking_send(RecordingCommand::FinalizeRealtimeBuffer);
+    }
+}
+
+fn is_control_key(keycode: u32) -> bool {
+    keycode == LEFT_CONTROL_KEYCODE || keycode == RIGHT_CONTROL_KEYCODE
+}
 
 fn handle_fn_press(
     command_tx: &mpsc::Sender<RecordingCommand>,
@@ -430,13 +552,17 @@ fn start_live_assist_rolling(
     rolling_hands_free.store(hands_free, Ordering::SeqCst);
 
     if !state_manager.is_recording() && !state_manager.is_recording_locked() {
-        let _ = command_tx.blocking_send(RecordingCommand::StartRecording);
+        let _ = command_tx.blocking_send(RecordingCommand::StartLiveAssistRecording);
     }
     let _ = command_tx.blocking_send(RecordingCommand::LockRecording);
 
     let timer_tx = command_tx.clone();
     let timer_active = rolling_active.clone();
     let timer_state_manager = state_manager.clone();
+    if live_assist_realtime_enabled() {
+        return;
+    }
+
     thread::spawn(move || {
         let mut next_chunk_seconds = LIVE_ASSIST_FIRST_CHUNK_SECONDS;
 
@@ -461,4 +587,11 @@ fn start_live_assist_rolling(
             next_chunk_seconds = LIVE_ASSIST_FOLLOWUP_CHUNK_SECONDS;
         }
     });
+}
+
+fn live_assist_realtime_enabled() -> bool {
+    matches!(
+        std::env::var("DICTARA_LIVE_ASSIST_REALTIME").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }

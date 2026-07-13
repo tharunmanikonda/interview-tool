@@ -26,6 +26,7 @@ export type HelperCommandType =
   | "start_capture"
   | "stop_capture"
   | "finalize_question"
+  | "clear_buffer"
   | "cancel_question"
   | "set_engine";
 

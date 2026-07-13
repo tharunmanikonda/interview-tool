@@ -50,7 +50,14 @@ export type ChatGptConversationMarkers = {
 export type ChatGptSendTimings = {
   onComposerInsertStarted?: () => void;
   onComposerInsertCompleted?: () => void;
+  onImageAttachStarted?: () => void;
+  onImageAttachCompleted?: () => void;
   onSendClicked?: () => void;
+};
+
+export type ChatGptSendAttachments = {
+  images?: ChatGptImageAttachment[];
+  hasPreattachedImages?: boolean;
 };
 
 const composerSelectors = [
@@ -71,6 +78,15 @@ const submitSelectors = [
   "button[aria-label='Send message']",
   "button[aria-label='Send']",
   "form button[type='submit']"
+];
+
+const stopSelectors = [
+  "button[data-testid='stop-button']",
+  "button[data-testid='composer-stop-button']",
+  "button[aria-label='Stop generating']",
+  "button[aria-label='Stop streaming']",
+  "button[aria-label='Stop response']",
+  "button[aria-label='Stop']"
 ];
 
 const answerSelectors = [
@@ -148,7 +164,7 @@ export class ChatGptAdapter {
     };
   }
 
-  async sendPrompt(prompt: string, timings: ChatGptSendTimings = {}) {
+  async sendPrompt(prompt: string, timings: ChatGptSendTimings = {}, attachments: ChatGptSendAttachments = {}) {
     const composer = this.findComposer();
     if (!composer) {
       throw new Error("ChatGPT composer was not found.");
@@ -160,7 +176,13 @@ export class ChatGptAdapter {
     await waitFor(() => readableText(composer).includes(safePrompt.slice(0, 40)) || composerText(composer).includes(safePrompt.slice(0, 40)), 1200);
     timings.onComposerInsertCompleted?.();
 
-    const submit = await waitFor(() => this.findSubmitButton(composer), 2500);
+    if (attachments.images?.length) {
+      timings.onImageAttachStarted?.();
+      await attachImagesToComposer(composer, attachments.images);
+      timings.onImageAttachCompleted?.();
+    }
+
+    const submit = await waitFor(() => this.findSubmitButton(composer), attachments.images?.length || attachments.hasPreattachedImages ? 7000 : 2500);
     if (submit) {
       timings.onSendClicked?.();
       submit.click();
@@ -173,6 +195,18 @@ export class ChatGptAdapter {
     }
     timings.onSendClicked?.();
     await wait(180);
+  }
+
+  async attachImages(images: ChatGptImageAttachment[], timings: Pick<ChatGptSendTimings, "onImageAttachStarted" | "onImageAttachCompleted"> = {}) {
+    if (!images.length) return;
+    const composer = this.findComposer();
+    if (!composer) {
+      throw new Error("ChatGPT composer was not found.");
+    }
+
+    timings.onImageAttachStarted?.();
+    await attachImagesToComposer(composer, images);
+    timings.onImageAttachCompleted?.();
   }
 
   observeLatestAnswer(onAnswer: (answer: ChatGptAnswerSnapshot) => void, options: { afterAssistantCount?: number } = {}) {
@@ -199,6 +233,27 @@ export class ChatGptAdapter {
       window.cancelAnimationFrame(raf);
       observer.disconnect();
     };
+  }
+
+  isGenerating() {
+    const composer = this.findComposer();
+    const roots = [
+      composer?.closest("form"),
+      composer?.closest("[data-testid='composer-root']") as HTMLElement | null,
+      composer?.parentElement,
+      document.body
+    ].filter((root): root is HTMLElement => Boolean(root));
+
+    for (const root of roots) {
+      for (const selector of stopSelectors) {
+        const button = root.querySelector<HTMLButtonElement>(selector);
+        if (button && isVisible(button) && !isInsideExtension(button) && !button.disabled) return true;
+      }
+    }
+
+    if (composer && isComposerBusy(composer)) return true;
+
+    return false;
   }
 
   scrollConversationToRatio(ratio: number) {
@@ -623,6 +678,7 @@ function sanitizeAnswerHtml(element: HTMLElement) {
   clone.querySelectorAll("img").forEach((node) => {
     if (!(node instanceof HTMLImageElement) || !hasSafeImageSource(node)) node.remove();
   });
+  prepareCodeBlocks(clone);
 
   clone.querySelectorAll<HTMLElement>("*").forEach((node) => {
     [...node.attributes].forEach((attribute) => {
@@ -638,6 +694,176 @@ function sanitizeAnswerHtml(element: HTMLElement) {
   });
 
   return clone.innerHTML;
+}
+
+function prepareCodeBlocks(root: HTMLElement) {
+  flattenNestedCodeBlocks(root);
+  root.querySelectorAll<HTMLElement>("pre").forEach((pre) => {
+    if (!pre.isConnected || pre.querySelector("pre")) return;
+    const code = pre.querySelector<HTMLElement>("code") || pre;
+    const language = inferCodeLanguage(pre, code);
+    pre.setAttribute("data-language", language);
+    pre.classList.add("gptd-code-card");
+    removeCodeBlockChrome(pre, language);
+
+    const rawCode = compactCodeBlankLines(stripLeadingLanguageLine(code.textContent || "", language));
+    code.textContent = "";
+    code.classList.add("gptd-code");
+
+    const lines = rawCode.split("\n");
+    lines.forEach((line, index) => {
+      const lineNode = document.createElement("span");
+      lineNode.className = "gptd-code-line";
+      appendHighlightedCode(lineNode, line);
+      if (!line) lineNode.append(document.createTextNode("\u200B"));
+      code.append(lineNode);
+      if (index < lines.length - 1) code.append(document.createTextNode("\n"));
+    });
+  });
+}
+
+function flattenNestedCodeBlocks(root: HTMLElement) {
+  root.querySelectorAll<HTMLElement>("pre").forEach((outerPre) => {
+    const innerPre = outerPre.querySelector<HTMLElement>("pre");
+    if (!innerPre) return;
+    outerPre.replaceWith(innerPre);
+  });
+}
+
+function removeCodeBlockChrome(pre: HTMLElement, language: string) {
+  const parent = pre.parentElement;
+  if (!parent) return;
+
+  for (const node of Array.from(parent.childNodes)) {
+    if (node === pre) continue;
+    if (node.nodeType === Node.TEXT_NODE && isLanguageChromeText(node.textContent?.trim() || "", language)) {
+      node.remove();
+    }
+  }
+
+  for (const sibling of Array.from(parent.children)) {
+    if (sibling === pre || sibling.contains(pre) || sibling.querySelector("pre, code, img")) continue;
+    const text = (sibling.textContent || "").trim();
+    if (isLanguageChromeText(text, language)) sibling.remove();
+  }
+
+  let previous = pre.previousElementSibling;
+  while (previous && isLanguageChromeText((previous.textContent || "").trim(), language)) {
+    const node = previous;
+    previous = previous.previousElementSibling;
+    node.remove();
+  }
+}
+
+function isLanguageChromeText(text: string, language: string) {
+  if (!text || text.length > 30) return false;
+  const normalized = text.toLowerCase();
+  const labels = new Set(["code", "sql", "go", "golang", "java", "python", "javascript", "typescript", "c++", "c#", language.toLowerCase()]);
+  return labels.has(normalized);
+}
+
+function inferCodeLanguage(pre: HTMLElement, code: HTMLElement) {
+  const text = code.textContent || "";
+  const detected = detectCodeLanguage(text);
+  const explicit =
+    pre.getAttribute("data-language") ||
+    code.getAttribute("data-language") ||
+    [...pre.classList, ...code.classList]
+      .map((className) => className.match(/(?:language|lang)-([a-z0-9+#.-]+)/i)?.[1])
+      .find(Boolean);
+
+  if (detected && (!explicit || shouldPreferDetectedLanguage(explicit, detected))) return detected;
+  if (explicit) return formatLanguageLabel(explicit);
+  return detected || "Code";
+}
+
+function detectCodeLanguage(text: string) {
+  if (/\bpackage\s+main\b|\bfunc\s+\w+\s*\(|:=|\bfmt\./.test(text)) return "Go";
+  if (/\bdef\s+\w+\s*\(|\bclass\s+\w+[:(]|\bimport\s+\w+/.test(text)) return "Python";
+  if (/\bpublic\s+class\b|\bSystem\.out\.println\b/.test(text)) return "Java";
+  if (/#include\s*<|std::|cout\s*<</.test(text)) return "C++";
+  if (/\bfunction\s+\w+\s*\(|\bconst\s+\w+\s*=|=>/.test(text)) return "JavaScript";
+  if (/\bSELECT\b|\bFROM\b|\bWHERE\b/i.test(text)) return "SQL";
+  return "";
+}
+
+function shouldPreferDetectedLanguage(explicit: string, detected: string) {
+  const label = formatLanguageLabel(explicit);
+  if (label === detected) return false;
+  if (label === "SQL" && /^(Go|Java|Python|C\+\+|JavaScript|TypeScript|React)$/.test(detected)) return true;
+  if (label === "Code" && detected) return true;
+  return false;
+}
+
+function stripLeadingLanguageLine(code: string, language: string) {
+  const lines = code.replace(/\u200B/g, "").split("\n");
+  while (lines.length && !lines[0].trim()) lines.shift();
+  const firstLine = lines[0]?.trim().toLowerCase();
+  const languageLine = language.toLowerCase();
+  if (firstLine && isLanguageChromeText(firstLine, languageLine)) {
+    lines.shift();
+    while (lines.length && !lines[0].trim()) lines.shift();
+  }
+  return lines.join("\n");
+}
+
+function compactCodeBlankLines(code: string) {
+  return code
+    .split("\n")
+    .filter((line, index, lines) => line.trim() || index === 0 || lines[index - 1]?.trim())
+    .join("\n")
+    .trimEnd();
+}
+
+function formatLanguageLabel(language: string) {
+  const normalized = language.toLowerCase();
+  const labels: Record<string, string> = {
+    js: "JavaScript",
+    jsx: "React",
+    ts: "TypeScript",
+    tsx: "React",
+    py: "Python",
+    python: "Python",
+    go: "Go",
+    golang: "Go",
+    java: "Java",
+    cpp: "C++",
+    cplusplus: "C++",
+    csharp: "C#",
+    cs: "C#",
+    sql: "SQL",
+    json: "JSON",
+    bash: "Bash",
+    shell: "Shell",
+    sh: "Shell"
+  };
+  return labels[normalized] || language.charAt(0).toUpperCase() + language.slice(1);
+}
+
+function appendHighlightedCode(parent: HTMLElement, line: string) {
+  const tokenPattern =
+    /(#.*$|\/\/.*$|\/\*.*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:class|def|return|if|elif|else|for|while|try|except|finally|with|as|import|from|pass|break|continue|lambda|in|is|not|and|or|public|private|protected|static|void|int|long|double|float|boolean|char|String|new|const|let|var|function|async|await|interface|type|extends|implements)\b|\b(?:True|False|None|true|false|null|undefined)\b|\b\d+(?:\.\d+)?\b|[{}()[\].,;:+\-*/%=<>!&|]+)/g;
+  let cursor = 0;
+  for (const match of line.matchAll(tokenPattern)) {
+    const token = match[0];
+    const index = match.index || 0;
+    if (index > cursor) parent.append(document.createTextNode(line.slice(cursor, index)));
+    const span = document.createElement("span");
+    span.className = codeTokenClass(token);
+    span.textContent = token;
+    parent.append(span);
+    cursor = index + token.length;
+  }
+  if (cursor < line.length) parent.append(document.createTextNode(line.slice(cursor)));
+}
+
+function codeTokenClass(token: string) {
+  if (/^(#|\/\/|\/\*)/.test(token)) return "gptd-code-comment";
+  if (/^["'`]/.test(token)) return "gptd-code-string";
+  if (/^\d/.test(token)) return "gptd-code-number";
+  if (/^(True|False|None|true|false|null|undefined)$/.test(token)) return "gptd-code-literal";
+  if (/^[{}()[\].,;:+\-*/%=<>!&|]+$/.test(token)) return "gptd-code-punctuation";
+  return "gptd-code-keyword";
 }
 
 function hasSafeImageSource(image: HTMLImageElement) {
@@ -663,6 +889,84 @@ async function focusAndSetText(element: HTMLElement, text: string) {
 
 function cleanOutgoingPrompt(prompt: string) {
   return prompt.replaceAll("[[GPTD_LIVE_ASSIST_FINALIZE]]", "").trim();
+}
+
+async function attachImagesToComposer(composer: HTMLElement, images: ChatGptImageAttachment[]) {
+  const files = await Promise.all(images.map(imageAttachmentToFile));
+  const validFiles = files.filter((file): file is File => Boolean(file));
+  if (!validFiles.length) return;
+
+  const root = composerRoot(composer);
+  const beforeCount = attachmentSignalCount(root);
+
+  if (await pasteFilesIntoComposer(composer, validFiles, beforeCount)) return;
+  if (await setFilesOnUploadInput(root, validFiles, beforeCount)) return;
+
+  throw new Error("Unable to attach pasted screenshot to ChatGPT composer.");
+}
+
+async function imageAttachmentToFile(image: ChatGptImageAttachment, index: number) {
+  if (!image.src.startsWith("data:")) return undefined;
+
+  const response = await fetch(image.src);
+  const blob = await response.blob();
+  const mime = blob.type || image.src.match(/^data:([^;,]+)/)?.[1] || "image/png";
+  const extension = mime.split("/")[1] || "png";
+  const safeName = (image.alt || `screenshot-${index + 1}.${extension}`).replace(/[^\w.\- ]+/g, "_");
+  return new File([blob], safeName.includes(".") ? safeName : `${safeName}.${extension}`, { type: mime });
+}
+
+async function pasteFilesIntoComposer(composer: HTMLElement, files: File[], beforeCount: number) {
+  composer.focus();
+  const dataTransfer = new DataTransfer();
+  files.forEach((file) => dataTransfer.items.add(file));
+
+  const event = new ClipboardEvent("paste", {
+    bubbles: true,
+    cancelable: true,
+    clipboardData: dataTransfer
+  });
+
+  if (!event.clipboardData || event.clipboardData.files.length === 0) {
+    Object.defineProperty(event, "clipboardData", { value: dataTransfer });
+  }
+
+  const dispatched = composer.dispatchEvent(event);
+  await wait(250);
+  const attached = await waitFor(() => attachmentSignalCount(composerRoot(composer)) > beforeCount, 2500);
+  return Boolean(attached);
+}
+
+async function setFilesOnUploadInput(root: HTMLElement, files: File[], beforeCount: number) {
+  const inputs = (uniqueElements([
+    ...Array.from(root.querySelectorAll<HTMLInputElement>("input[type='file']")),
+    ...Array.from(document.querySelectorAll<HTMLInputElement>("input[type='file']"))
+  ]) as HTMLInputElement[]).filter((input) => !isInsideExtension(input));
+
+  for (const input of inputs) {
+    const dataTransfer = new DataTransfer();
+    files.forEach((file) => dataTransfer.items.add(file));
+    input.files = dataTransfer.files;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    const attached = await waitFor(() => attachmentSignalCount(composerRoot(root)) > beforeCount, 3500);
+    if (attached) return true;
+  }
+
+  return false;
+}
+
+function composerRoot(composer: HTMLElement) {
+  return (
+    (composer.closest("form") as HTMLElement | null) ||
+    (composer.closest("[data-testid='composer-root']") as HTMLElement | null) ||
+    composer.parentElement ||
+    composer
+  );
+}
+
+function attachmentSignalCount(root: HTMLElement) {
+  return root.querySelectorAll("img, [data-testid*='attachment'], [data-testid*='file'], [aria-label*='Attached'], [aria-label*='attachment'], [aria-label*='file']").length;
 }
 
 function pressEnter(element: HTMLElement) {
@@ -744,6 +1048,25 @@ function isLikelyComposer(element: HTMLElement) {
   if (rect.top < window.innerHeight * 0.35) return false;
   const label = [element.getAttribute("aria-label"), element.getAttribute("placeholder"), element.id].filter(Boolean).join(" ").toLowerCase();
   return element.id === "prompt-textarea" || label.includes("message") || label.includes("prompt") || element.isContentEditable;
+}
+
+function isComposerBusy(composer: HTMLElement) {
+  const root =
+    composer.closest("form") ||
+    composer.closest("[data-testid='composer-root']") ||
+    composer.parentElement ||
+    composer;
+  const busyValue = [
+    composer.getAttribute("aria-busy"),
+    root.getAttribute("aria-busy"),
+    root.getAttribute("data-state"),
+    root.getAttribute("data-status")
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return busyValue.includes("true") || busyValue.includes("busy") || busyValue.includes("stream") || busyValue.includes("generat");
 }
 
 function isUsableButton(button: HTMLButtonElement) {

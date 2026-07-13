@@ -1,14 +1,17 @@
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
+use serde::Deserialize;
 use serde::Serialize;
 use std::sync::{LazyLock, Mutex};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{Request, Response},
     tungstenite::Message,
 };
+
+use crate::recording::RecordingCommand;
 
 const NATIVE_BRIDGE_ADDR: &str = "127.0.0.1:43217";
 const NATIVE_BRIDGE_PATH: &str = "/live-assist";
@@ -19,6 +22,10 @@ static BRIDGE: LazyLock<LiveAssistBridge> = LazyLock::new(LiveAssistBridge::new)
 
 pub fn start() {
     BRIDGE.start();
+}
+
+pub fn set_command_sender(sender: mpsc::Sender<RecordingCommand>) {
+    BRIDGE.set_command_sender(sender);
 }
 
 pub fn capture_started() {
@@ -70,6 +77,7 @@ pub fn transcription_error(message: &str) {
 
 struct LiveAssistBridge {
     sender: broadcast::Sender<String>,
+    command_sender: Mutex<Option<mpsc::Sender<RecordingCommand>>>,
     state: Mutex<BridgeState>,
     started: Mutex<bool>,
 }
@@ -87,8 +95,16 @@ impl LiveAssistBridge {
         let (sender, _) = broadcast::channel(128);
         Self {
             sender,
+            command_sender: Mutex::new(None),
             state: Mutex::new(BridgeState::default()),
             started: Mutex::new(false),
+        }
+    }
+
+    fn set_command_sender(&self, sender: mpsc::Sender<RecordingCommand>) {
+        match self.command_sender.lock() {
+            Ok(mut command_sender) => *command_sender = Some(sender),
+            Err(error) => error!("Live Assist bridge command sender lock failed: {}", error),
         }
     }
 
@@ -298,6 +314,37 @@ impl LiveAssistBridge {
             Err(error) => error!("Failed to serialize Live Assist event: {}", error),
         }
     }
+
+    fn handle_command(&self, command: BridgeCommand) {
+        let recording_command = match command.command_type.as_str() {
+            "clear_buffer" => Some(RecordingCommand::ClearRealtimeBuffer),
+            "finalize_question" => Some(RecordingCommand::FinalizeRealtimeBuffer),
+            "cancel_question" | "stop_capture" => Some(RecordingCommand::Cancel),
+            "start_capture" => Some(RecordingCommand::StartLiveAssistRecording),
+            _ => None,
+        };
+
+        let Some(recording_command) = recording_command else {
+            return;
+        };
+
+        let sender = match self.command_sender.lock() {
+            Ok(command_sender) => command_sender.clone(),
+            Err(error) => {
+                error!("Live Assist bridge command sender lock failed: {}", error);
+                None
+            }
+        };
+
+        let Some(sender) = sender else {
+            warn!("Live Assist bridge command ignored before recorder is ready");
+            return;
+        };
+
+        if let Err(error) = sender.try_send(recording_command) {
+            warn!("Live Assist bridge command failed: {}", error);
+        }
+    }
 }
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -352,6 +399,12 @@ async fn handle_connection(
             message = reader.next() => {
                 match message {
                     Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Text(payload))) => {
+                        match serde_json::from_str::<BridgeCommand>(&payload) {
+                            Ok(command) => BRIDGE.handle_command(command),
+                            Err(error) => warn!("Live Assist bridge ignored unreadable command: {}", error),
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(Box::new(error)),
                 }
@@ -360,6 +413,13 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeCommand {
+    #[serde(rename = "type")]
+    command_type: String,
 }
 
 #[derive(Serialize)]

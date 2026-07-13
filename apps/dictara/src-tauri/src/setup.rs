@@ -187,6 +187,7 @@ pub fn setup_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), Box<dyn std::er
 
     // Create channel for recording commands (KeyListener → Controller)
     let (command_tx, command_rx) = mpsc::channel::<RecordingCommand>(100);
+    live_assist_bridge::set_command_sender(command_tx.clone());
     let state_manager = Arc::new(RecordingStateManager::new());
 
     // Clone sender for Tauri state (mpsc::Sender is Clone + Send + Sync)

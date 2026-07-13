@@ -49,9 +49,15 @@ import { NativeBridge, NativeBridgeStatus } from "../src/nativeBridge";
 import { LiveDocPublisher, LiveDocPublisherStatus, StoredLiveDocSession, defaultDocsServerUrl, normalizeDocsServerUrl } from "../src/liveDocPublisher";
 import {
   DEFAULT_PROMPT_SETTINGS,
+  PromptPreviewKind,
+  RESPONSE_PROMPT_KINDS,
   PromptSettings,
+  ResponsePromptKind,
+  buildDiscussionSoFar,
   compilePromptTemplate,
   loadPromptSettings,
+  promptKindLabel,
+  promptTemplateForKind,
   savePromptSettings,
   validatePromptSettings
 } from "../src/promptSettings";
@@ -126,6 +132,8 @@ type StoredTurnLedgerEntry = {
   id: string;
   conversationId: string;
   question: string;
+  questionImages?: ChatGptImageAttachment[];
+  questionFiles?: ChatGptFileAttachment[];
   starter?: string;
   answer: string;
   answerHtml?: string;
@@ -460,6 +468,8 @@ function ledgerTurnToHydratable(turn: StoredTurnLedgerEntry): HydratableConversa
   return {
     id: turn.id,
     question: turn.question,
+    questionImages: turn.questionImages,
+    questionFiles: turn.questionFiles,
     starter: turn.starter,
     answer: turn.answer || turn.error || "",
     answerHtml: turn.answerHtml,
@@ -502,6 +512,34 @@ function createLedgerTurn(conversationId: string, question: string): StoredTurnL
 
 function normalizeQuestionForLedger(question: string) {
   return question.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function mergeImageAttachments(existing: ChatGptImageAttachment[] = [], incoming: ChatGptImageAttachment[] = []) {
+  const seen = new Set<string>();
+  const merged: ChatGptImageAttachment[] = [];
+  for (const image of [...existing, ...incoming]) {
+    const key = image.src || image.alt || "";
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(image);
+  }
+  return merged;
+}
+
+function mergeFileAttachments(existing: ChatGptFileAttachment[] = [], incoming: ChatGptFileAttachment[] = []) {
+  const seen = new Set<string>();
+  const merged: ChatGptFileAttachment[] = [];
+  for (const file of [...existing, ...incoming]) {
+    const key = `${file.href || ""}:${file.name}`;
+    if (!file.name || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(file);
+  }
+  return merged;
 }
 
 function shouldSendStarterForChunk(event: HelperEvent) {
@@ -804,6 +842,8 @@ function LiveAssistOverlay() {
   const [isCapturingTab, setIsCapturingTab] = useState(false);
   const [tabLevel, setTabLevel] = useState(0);
   const [typedText, setTypedText] = useState("");
+  const [draftQuestionImages, setDraftQuestionImagesState] = useState<ChatGptImageAttachment[]>([]);
+  const [pendingImageUploads, setPendingImageUploads] = useState(0);
   const [typedRole, setTypedRole] = useState<InputRole>("interviewer");
   const [starterMode, setStarterMode] = useState<StarterMode>("neutral-speculative");
   const [statusText, setStatusText] = useState("Ready");
@@ -817,7 +857,8 @@ function LiveAssistOverlay() {
   const [draftPromptSettings, setDraftPromptSettings] = useState<PromptSettings>(DEFAULT_PROMPT_SETTINGS);
   const [promptSettingsMessage, setPromptSettingsMessage] = useState("Defaults loaded");
   const [promptSettingsWarnings, setPromptSettingsWarnings] = useState<string[]>([]);
-  const [promptPreviewKind, setPromptPreviewKind] = useState<"starter" | "final">("starter");
+  const [promptPreviewKind, setPromptPreviewKind] = useState<PromptPreviewKind>("starter");
+  const [responsePromptKind, setResponsePromptKind] = useState<ResponsePromptKind>("general");
   const [activeMarkerIndex, setActiveMarkerIndex] = useState(0);
   const [liveDocSession, setLiveDocSession] = useState<StoredLiveDocSession | undefined>();
   const [liveDocStatus, setLiveDocStatus] = useState<LiveDocPublisherStatus>("off");
@@ -825,18 +866,27 @@ function LiveAssistOverlay() {
   const [liveDocServerUrl, setLiveDocServerUrl] = useState(() => defaultDocsServerUrl());
   const [draftLiveDocServerUrl, setDraftLiveDocServerUrl] = useState(() => defaultDocsServerUrl());
   const captureTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const draftQuestionImagesRef = useRef<ChatGptImageAttachment[]>([]);
+  const preattachedQuestionImageSrcsRef = useRef<Set<string>>(new Set());
+  const pendingImageUploadsRef = useRef(0);
   const docScrollRef = useRef<HTMLElement | null>(null);
   const silentDocScrollUntilRef = useRef(0);
   const autoFollowLatestRef = useRef(true);
   const lastDocScrollTopRef = useRef(0);
   const savedDocScrollTopRef = useRef(0);
   const saveScrollTimerRef = useRef<number | undefined>(undefined);
+  const saveLedgerTimerRef = useRef<number | undefined>(undefined);
+  const publishLiveDocTimerRef = useRef<number | undefined>(undefined);
+  const markerUpdateTimerRef = useRef<number | undefined>(undefined);
+  const answerScrollTimerRef = useRef<number | undefined>(undefined);
   const isRestoringScrollRef = useRef(false);
   const flowDebounceRef = useRef<number | undefined>(undefined);
   const focusIntervalRef = useRef<number | undefined>(undefined);
   const lastFlowSubmittedRef = useRef("");
   const nativeStatusRef = useRef<NativeBridgeStatus>("disconnected");
   const rollingQuestionRef = useRef<RollingQuestionState>(createEmptyRollingQuestion());
+  const latestRawTranscriptRef = useRef("");
+  const clearTranscriptBaselineRef = useRef("");
   const realtimeCaptureStartedAtRef = useRef<number | undefined>(undefined);
   const realtimeStarterTimerRef = useRef<number | undefined>(undefined);
   const finalizeAfterNextChunkRef = useRef(false);
@@ -861,6 +911,105 @@ function LiveAssistOverlay() {
       createdAt: new Date().toLocaleTimeString()
     };
     setDebugEntries((entries) => [entry, ...entries].slice(0, 8));
+  }
+
+  function setDraftQuestionImages(images: ChatGptImageAttachment[]) {
+    draftQuestionImagesRef.current = images;
+    setDraftQuestionImagesState(images);
+  }
+
+  function clearDraftInputs() {
+    setTypedText("");
+    setDraftQuestionImages([]);
+    preattachedQuestionImageSrcsRef.current.clear();
+    pendingImageUploadsRef.current = 0;
+    setPendingImageUploads(0);
+  }
+
+  function unattachedDraftImages(images = draftQuestionImagesRef.current) {
+    return images.filter((image) => !preattachedQuestionImageSrcsRef.current.has(image.src));
+  }
+
+  function isImageUploadPending() {
+    return pendingImageUploadsRef.current > 0 || pendingImageUploads > 0;
+  }
+
+  function updatePendingImageUploads(delta: number) {
+    pendingImageUploadsRef.current = Math.max(0, pendingImageUploadsRef.current + delta);
+    setPendingImageUploads(pendingImageUploadsRef.current);
+  }
+
+  async function waitForPendingImageUploads() {
+    if (!isImageUploadPending()) return true;
+    setStatusText("Uploading screenshot to ChatGPT. Sending will continue when it is ready...");
+    const started = Date.now();
+    while (pendingImageUploadsRef.current > 0 && Date.now() - started < 10000) {
+      await sleep(100);
+    }
+    if (pendingImageUploadsRef.current > 0) {
+      setStatusText("Screenshot upload is still pending. Wait for it to finish, then send again.");
+      return false;
+    }
+    return true;
+  }
+
+  function clearLiveQuestionDraft(reason = "Live question buffer cleared") {
+    if (realtimeStarterTimerRef.current) {
+      window.clearTimeout(realtimeStarterTimerRef.current);
+      realtimeStarterTimerRef.current = undefined;
+    }
+    clearTranscriptBaselineRef.current = latestRawTranscriptRef.current || rollingQuestionRef.current.buffer || "";
+    const emptyQuestion = createEmptyRollingQuestion(rollingQuestionRef.current.sessionId);
+    setRollingQuestion(emptyQuestion);
+    rollingQuestionRef.current = emptyQuestion;
+    starterSentRef.current = false;
+    starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
+    pendingStarterQuestionRef.current = "";
+    lastStarterQuestionSentRef.current = "";
+    activeLedgerTurnIdRef.current = undefined;
+    engine.clearPartialTranscript();
+    clearDraftInputs();
+    captureTimelineEvent("cleared", reason);
+    setStatusText(reason);
+  }
+
+  function isNativeCaptureActive(status: NativeBridgeStatus = nativeStatusRef.current) {
+    return status === "capturing" || status === "transcribing";
+  }
+
+  function visibleTranscriptFromRaw(rawText: string) {
+    const raw = rawText.trim();
+    const baseline = clearTranscriptBaselineRef.current.trim();
+    if (!raw || !baseline) return raw;
+    if (raw === baseline) return "";
+    if (raw.startsWith(baseline)) return raw.slice(baseline.length).trim();
+
+    const rawNormalized = normalizeQuestionForLedger(raw);
+    const baselineNormalized = normalizeQuestionForLedger(baseline);
+    if (!rawNormalized || !baselineNormalized) return raw;
+    if (rawNormalized === baselineNormalized) return "";
+    if (!rawNormalized.startsWith(baselineNormalized)) return raw;
+
+    return removeApproximatePrefix(raw, baseline);
+  }
+
+  function removeApproximatePrefix(raw: string, baseline: string) {
+    const baselineNormalized = normalizeQuestionForLedger(baseline);
+    if (!baselineNormalized) return raw.trim();
+
+    for (let index = 1; index <= raw.length; index += 1) {
+      const prefixNormalized = normalizeQuestionForLedger(raw.slice(0, index));
+      if (!prefixNormalized) continue;
+      if (prefixNormalized === baselineNormalized || prefixNormalized.length >= baselineNormalized.length) {
+        return raw.slice(index).trim();
+      }
+    }
+
+    return raw.trim();
+  }
+
+  function requestLiveQuestionClear() {
+    clearLiveQuestionDraft("Live buffer cleared. Still listening.");
   }
 
   function captureTimelineEvent(label: string, detail?: string) {
@@ -905,6 +1054,8 @@ function LiveAssistOverlay() {
     return {
       onComposerInsertStarted: () => recordTurnLatencyCheckpoint(turnId, "composerInsertStartedAt"),
       onComposerInsertCompleted: () => recordTurnLatencyCheckpoint(turnId, "composerInsertCompletedAt"),
+      onImageAttachStarted: () => recordTurnLatencyCheckpoint(turnId, "imageAttachStartedAt"),
+      onImageAttachCompleted: () => recordTurnLatencyCheckpoint(turnId, "imageAttachCompletedAt"),
       onSendClicked: () => {
         const now = performance.now();
         recordTurnLatencyCheckpoint(turnId, "sendClickedAt", now);
@@ -958,6 +1109,14 @@ function LiveAssistOverlay() {
     }, 250);
   }
 
+  function scheduleSaveTurnLedger(conversationId: string, turns: StoredTurnLedgerEntry[]) {
+    if (saveLedgerTimerRef.current) window.clearTimeout(saveLedgerTimerRef.current);
+    const snapshot = turns.map((turn) => stripUndefined(turn));
+    saveLedgerTimerRef.current = window.setTimeout(() => {
+      void saveTurnLedger(conversationId, snapshot);
+    }, 450);
+  }
+
   function updateActiveMarkerFromScroll() {
     const scroll = docScrollRef.current;
     if (!scroll) return;
@@ -982,7 +1141,12 @@ function LiveAssistOverlay() {
       }
     });
 
-    setActiveMarkerIndex(bestIndex);
+    setActiveMarkerIndex((current) => (current === bestIndex ? current : bestIndex));
+  }
+
+  function scheduleActiveMarkerUpdate(delay = 90) {
+    if (markerUpdateTimerRef.current) window.clearTimeout(markerUpdateTimerRef.current);
+    markerUpdateTimerRef.current = window.setTimeout(updateActiveMarkerFromScroll, delay);
   }
 
   function scrollToTurn(index: number) {
@@ -1033,7 +1197,7 @@ function LiveAssistOverlay() {
   function setLedgerTurns(nextTurns: StoredTurnLedgerEntry[], options: { hydrate?: boolean } = {}) {
     const sortedTurns = [...nextTurns].filter((turn) => turn.question.trim()).sort((a, b) => a.createdAt - b.createdAt);
     ledgerTurnsRef.current = sortedTurns;
-    void saveTurnLedger(conversationIdRef.current, sortedTurns);
+    scheduleSaveTurnLedger(conversationIdRef.current, sortedTurns);
     if (options.hydrate) hydrateEngineFromLedger(sortedTurns);
   }
 
@@ -1043,15 +1207,19 @@ function LiveAssistOverlay() {
     return nextTurns.find((turn) => turn.id === turnId);
   }
 
-  function ensureLedgerTurn(question: string) {
+  function ensureLedgerTurn(question: string, attachments: { questionImages?: ChatGptImageAttachment[]; questionFiles?: ChatGptFileAttachment[] } = {}) {
     const normalizedQuestion = question.trim();
+    const nextImages = attachments.questionImages || [];
+    const nextFiles = attachments.questionFiles || [];
     const activeTurn = activeLedgerTurnIdRef.current ? ledgerTurnsRef.current.find((turn) => turn.id === activeLedgerTurnIdRef.current) : undefined;
     if (activeTurn) {
       const updated = updateLedgerTurn(
         activeTurn.id,
         (turn) => ({
           ...turn,
-          question: normalizedQuestion.length >= turn.question.length ? normalizedQuestion : turn.question
+          question: normalizedQuestion.length >= turn.question.length ? normalizedQuestion : turn.question,
+          questionImages: mergeImageAttachments(turn.questionImages, nextImages),
+          questionFiles: mergeFileAttachments(turn.questionFiles, nextFiles)
         }),
         { hydrate: false }
       );
@@ -1064,10 +1232,24 @@ function LiveAssistOverlay() {
       .find((turn) => normalizeQuestionForLedger(turn.question) === normalized && Date.now() - turn.createdAt < 6000);
     if (recentDuplicate) {
       activeLedgerTurnIdRef.current = recentDuplicate.id;
+      if (nextImages.length || nextFiles.length) {
+        const updated = updateLedgerTurn(
+          recentDuplicate.id,
+          (turn) => ({
+            ...turn,
+            questionImages: mergeImageAttachments(turn.questionImages, nextImages),
+            questionFiles: mergeFileAttachments(turn.questionFiles, nextFiles)
+          }),
+          { hydrate: false }
+        );
+        return updated || recentDuplicate;
+      }
       return recentDuplicate;
     }
 
     const turn = createLedgerTurn(conversationIdRef.current, normalizedQuestion);
+    if (nextImages.length) turn.questionImages = nextImages;
+    if (nextFiles.length) turn.questionFiles = nextFiles;
     activeLedgerTurnIdRef.current = turn.id;
     setLedgerTurns([...ledgerTurnsRef.current, turn], { hydrate: true });
     return turn;
@@ -1102,7 +1284,7 @@ function LiveAssistOverlay() {
 
   useEffect(() => {
     stateRef.current = state;
-    window.setTimeout(updateActiveMarkerFromScroll, 80);
+    scheduleActiveMarkerUpdate(80);
   }, [state]);
 
   useEffect(() => {
@@ -1297,8 +1479,18 @@ function LiveAssistOverlay() {
       }
 
       const stableDelayMs = activeRequest.kind === "starter" ? 650 : 1300;
-      if (answerStableTimerRef.current) window.clearTimeout(answerStableTimerRef.current);
-      answerStableTimerRef.current = window.setTimeout(() => {
+      const finishIfChatGptIdle = () => {
+        const currentRequest = activeRequestRef.current;
+        if (!currentRequest || currentRequest.turnId !== activeRequest.turnId || currentRequest.kind !== activeRequest.kind) {
+          return;
+        }
+
+        if (adapter.isGenerating()) {
+          setStatusText("ChatGPT is still generating...");
+          answerStableTimerRef.current = window.setTimeout(finishIfChatGptIdle, 700);
+          return;
+        }
+
         const answerStableAt = performance.now();
         const hadQueuedFollowUp = stateRef.current.queuedQuestions.length > 0;
         const completedRequest = activeRequestRef.current;
@@ -1351,7 +1543,9 @@ function LiveAssistOverlay() {
           setStatusText("Sending queued follow-up to ChatGPT...");
           void sendToChatGpt();
         }
-      }, stableDelayMs);
+      };
+      if (answerStableTimerRef.current) window.clearTimeout(answerStableTimerRef.current);
+      answerStableTimerRef.current = window.setTimeout(finishIfChatGptIdle, stableDelayMs);
     });
   }, [adapter, engine]);
 
@@ -1375,17 +1569,19 @@ function LiveAssistOverlay() {
     if (state.turns.length === 0) return;
     window.setTimeout(() => {
       scrollLatestTurnIntoView();
-      updateActiveMarkerFromScroll();
+      scheduleActiveMarkerUpdate(60);
     }, 80);
   }, [state.turns.length]);
 
   useEffect(() => {
     if (state.phase !== "generating") return;
     if (!state.currentAssistantAnswer.trim()) return;
-    window.setTimeout(() => {
+    if (rollingQuestionRef.current.buffer.trim()) return;
+    if (answerScrollTimerRef.current) window.clearTimeout(answerScrollTimerRef.current);
+    answerScrollTimerRef.current = window.setTimeout(() => {
       scrollLatestTurnIntoView("end");
-      updateActiveMarkerFromScroll();
-    }, 30);
+      scheduleActiveMarkerUpdate(60);
+    }, 120);
   }, [state.currentAssistantAnswer, state.phase]);
 
   useEffect(() => {
@@ -1397,7 +1593,7 @@ function LiveAssistOverlay() {
       if (performance.now() < silentDocScrollUntilRef.current) return;
       updateAutoFollowFromManualScroll();
       scheduleSaveDocScrollTop();
-      updateActiveMarkerFromScroll();
+      scheduleActiveMarkerUpdate(80);
     };
 
     scroll.addEventListener("scroll", handleScroll, { passive: true });
@@ -1412,6 +1608,13 @@ function LiveAssistOverlay() {
       if (flowDebounceRef.current) window.clearTimeout(flowDebounceRef.current);
       if (answerStableTimerRef.current) window.clearTimeout(answerStableTimerRef.current);
       if (saveScrollTimerRef.current) window.clearTimeout(saveScrollTimerRef.current);
+      if (saveLedgerTimerRef.current) {
+        window.clearTimeout(saveLedgerTimerRef.current);
+        void saveTurnLedger(conversationIdRef.current, ledgerTurnsRef.current);
+      }
+      if (publishLiveDocTimerRef.current) window.clearTimeout(publishLiveDocTimerRef.current);
+      if (markerUpdateTimerRef.current) window.clearTimeout(markerUpdateTimerRef.current);
+      if (answerScrollTimerRef.current) window.clearTimeout(answerScrollTimerRef.current);
       if (realtimeStarterTimerRef.current) window.clearTimeout(realtimeStarterTimerRef.current);
     };
   }, []);
@@ -1447,7 +1650,10 @@ function LiveAssistOverlay() {
 
   useEffect(() => {
     if (!liveDocSession) return;
-    liveDocPublisher.publish(buildLiveDocSnapshot(liveDocSession));
+    if (publishLiveDocTimerRef.current) window.clearTimeout(publishLiveDocTimerRef.current);
+    publishLiveDocTimerRef.current = window.setTimeout(() => {
+      liveDocPublisher.publish(buildLiveDocSnapshot(liveDocSession));
+    }, latency.status === "streaming" ? 220 : 80);
   }, [
     liveDocSession,
     state,
@@ -1507,6 +1713,8 @@ function LiveAssistOverlay() {
     if (event.type === "capture_started") {
       setNativeStatus("capturing");
       nativeStatusRef.current = "capturing";
+      latestRawTranscriptRef.current = "";
+      clearTranscriptBaselineRef.current = "";
       captureTimelineEvent("listening", "Realtime capture started");
       setRollingQuestion(createEmptyRollingQuestion(event.sessionId));
       rollingQuestionRef.current = createEmptyRollingQuestion(event.sessionId);
@@ -1514,7 +1722,6 @@ function LiveAssistOverlay() {
       if (realtimeStarterTimerRef.current) window.clearTimeout(realtimeStarterTimerRef.current);
       realtimeStarterTimerRef.current = undefined;
       activeLedgerTurnIdRef.current = undefined;
-      setTypedText("");
       engine.clearPartialTranscript();
       setStatusText("Always listening. Fn sends, Control gets starter, long-hold Fn stops.");
       return;
@@ -1531,8 +1738,13 @@ function LiveAssistOverlay() {
       setNativeStatus("capturing");
       nativeStatusRef.current = "capturing";
       captureTimelineEvent("transcript received");
-      const text = event.text?.trim() || "";
-      if (!text) return;
+      const rawText = event.text?.trim() || "";
+      latestRawTranscriptRef.current = rawText;
+      const text = visibleTranscriptFromRaw(rawText);
+      if (!text) {
+        setStatusText("Live buffer cleared. Still listening.");
+        return;
+      }
 
       const next: RollingQuestionState = {
         sessionId: event.sessionId || rollingQuestionRef.current.sessionId,
@@ -1557,7 +1769,6 @@ function LiveAssistOverlay() {
         );
       }
 
-      setTypedText("");
       setStatusText(starterPolicyRef.current.sentCount > 0 ? "Listening. Starter ready for this question." : "Listening. Press Fn to send or Control for starter.");
       return;
     }
@@ -1605,22 +1816,26 @@ function LiveAssistOverlay() {
       if (!keepListening) realtimeCaptureStartedAtRef.current = undefined;
       setNativeStatus(keepListening ? "capturing" : "connected");
       nativeStatusRef.current = keepListening ? "capturing" : "connected";
-      const question = event.text?.trim();
+      if (event.text) latestRawTranscriptRef.current = event.text.trim();
+      const visibleFinalText = rollingQuestionRef.current.buffer || visibleTranscriptFromRaw(event.text || "");
+      const question = buildQuestionFromDraft(visibleFinalText);
       if (!question) {
         setStatusText("No question text captured yet.");
         return;
       }
+      const questionImages = draftQuestionImagesRef.current;
 
       starterSentRef.current = false;
       pendingStarterQuestionRef.current = "";
       lastStarterQuestionSentRef.current = "";
-      const turn = ensureLedgerTurn(question);
+      const turn = ensureLedgerTurn(question, { questionImages });
       engine.finalizeActiveInterviewerQuestion(question, starterMode);
       updateLedgerTurn(
         turn.id,
         (current) => ({
           ...current,
           question,
+          questionImages: mergeImageAttachments(current.questionImages, questionImages),
           latency: {
             ...current.latency,
             checkpoints: {
@@ -1635,6 +1850,8 @@ function LiveAssistOverlay() {
       const emptyQuestion = createEmptyRollingQuestion(event.sessionId);
       setRollingQuestion(emptyQuestion);
       rollingQuestionRef.current = emptyQuestion;
+      clearTranscriptBaselineRef.current = latestRawTranscriptRef.current;
+      clearDraftInputs();
       starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
       pendingStarterQuestionRef.current = "";
 
@@ -1649,21 +1866,7 @@ function LiveAssistOverlay() {
     }
 
     if (event.type === "buffer_cleared") {
-      if (realtimeStarterTimerRef.current) {
-        window.clearTimeout(realtimeStarterTimerRef.current);
-        realtimeStarterTimerRef.current = undefined;
-      }
-      setRollingQuestion(createEmptyRollingQuestion(event.sessionId));
-      rollingQuestionRef.current = createEmptyRollingQuestion(event.sessionId);
-      starterSentRef.current = false;
-      starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
-      pendingStarterQuestionRef.current = "";
-      lastStarterQuestionSentRef.current = "";
-      activeLedgerTurnIdRef.current = undefined;
-      engine.clearPartialTranscript();
-      setTypedText("");
-      captureTimelineEvent("cleared", "Live question buffer cleared");
-      setStatusText("Live buffer cleared. Still listening.");
+      clearLiveQuestionDraft("Live buffer cleared. Still listening.");
       return;
     }
 
@@ -1697,6 +1900,8 @@ function LiveAssistOverlay() {
         realtimeStarterTimerRef.current = undefined;
       }
       realtimeCaptureStartedAtRef.current = undefined;
+      latestRawTranscriptRef.current = "";
+      clearTranscriptBaselineRef.current = "";
       setNativeStatus("connected");
       nativeStatusRef.current = "connected";
       captureTimelineEvent("stopped", "Realtime capture stopped");
@@ -1739,6 +1944,14 @@ function LiveAssistOverlay() {
   }
 
   function finalizeNativeQuestion() {
+    if (isNativeCaptureActive()) {
+      if (nativeBridge.finalizeQuestion()) {
+        setStatusText("Sending captured question...");
+        captureTimelineEvent("finalize requested", "Send button / Enter");
+      }
+      return;
+    }
+
     if (rollingQuestionRef.current.buffer.trim() || typedText.trim()) {
       finalizeRollingPasteQuestion();
       return;
@@ -1753,7 +1966,7 @@ function LiveAssistOverlay() {
     flowDebounceRef.current = undefined;
     setRollingQuestion(createEmptyRollingQuestion());
     rollingQuestionRef.current = createEmptyRollingQuestion();
-    setTypedText("");
+    clearDraftInputs();
     setStatusText("Rolling question cancelled.");
   }
 
@@ -1821,6 +2034,74 @@ function LiveAssistOverlay() {
     flowDebounceRef.current = window.setTimeout(processDictaraPaste, 150);
   }
 
+  async function handleCapturePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    let imageFiles = imageFilesFromClipboardData(event.clipboardData);
+
+    if (imageFiles.length === 0) {
+      imageFiles = await readImageFilesFromClipboard().catch(() => []);
+    }
+
+    if (imageFiles.length === 0) return;
+
+    event.preventDefault();
+    const pastedText = event.clipboardData.getData("text/plain")?.trim();
+    if (pastedText) {
+      insertTypedTextAtCursor(pastedText);
+    }
+
+    try {
+      const attachments = await Promise.all(imageFiles.map((file, index) => imageFileToAttachment(file, index)));
+      setDraftQuestionImages(mergeImageAttachments(draftQuestionImagesRef.current, attachments));
+      captureTimelineEvent("screenshot", `${attachments.length} screenshot${attachments.length === 1 ? "" : "s"} pasted`);
+      setStatusText(`${attachments.length} screenshot${attachments.length === 1 ? "" : "s"} captured. Uploading to ChatGPT...`);
+      debug(`Screenshot paste captured: ${attachments.map((attachment) => attachment.alt || "image").join(", ")}`);
+      updatePendingImageUploads(attachments.length);
+      await adapter.attachImages(attachments);
+      attachments.forEach((attachment) => preattachedQuestionImageSrcsRef.current.add(attachment.src));
+      setStatusText(`${attachments.length} screenshot${attachments.length === 1 ? "" : "s"} uploaded to ChatGPT.`);
+      captureTimelineEvent("screenshot uploaded", `${attachments.length} screenshot${attachments.length === 1 ? "" : "s"} ready in ChatGPT`);
+    } catch (error) {
+      setStatusText(error instanceof Error ? error.message : "Unable to read pasted screenshot.");
+      debug(`Screenshot paste failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      updatePendingImageUploads(-imageFiles.length);
+    }
+  }
+
+  function insertTypedTextAtCursor(text: string) {
+    const textarea = captureTextareaRef.current;
+    if (!textarea) {
+      setTypedText((current) => [current, text].filter(Boolean).join("\n"));
+      return;
+    }
+
+    const current = typedText;
+    const start = textarea.selectionStart ?? current.length;
+    const end = textarea.selectionEnd ?? current.length;
+    const next = `${current.slice(0, start)}${text}${current.slice(end)}`;
+    setTypedText(next);
+    window.requestAnimationFrame(() => {
+      const caret = start + text.length;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    });
+  }
+
+  function removeDraftQuestionImage(src: string) {
+    preattachedQuestionImageSrcsRef.current.delete(src);
+    setDraftQuestionImages(draftQuestionImagesRef.current.filter((image) => image.src !== src));
+    setStatusText("Screenshot removed from next question.");
+  }
+
+  function buildQuestionFromDraft(transcriptText: string) {
+    const transcript = transcriptText.trim();
+    const typed = typedText.trim();
+    if (transcript && typed && normalizeQuestionForLedger(transcript) !== normalizeQuestionForLedger(typed)) {
+      return `${transcript}\n\nTyped notes:\n${typed}`;
+    }
+    return transcript || typed;
+  }
+
   function appendRollingPasteChunk(text: string, options: { skipStarter?: boolean } = {}) {
     const event: HelperEvent = {
       type: "chunk_transcribed",
@@ -1847,6 +2128,7 @@ function LiveAssistOverlay() {
   async function maybeSendStarterToChatGpt(partialQuestion: string) {
     const normalizedQuestion = partialQuestion.trim();
     if (normalizedQuestion.length < 10) return;
+    if (!(await waitForPendingImageUploads())) return;
     if (starterPolicyRef.current.sentCount >= starterPolicyRef.current.maxCount) {
       setStatusText("Chunk added locally. Holding full question until release.");
       return;
@@ -1887,7 +2169,9 @@ function LiveAssistOverlay() {
       const startedAt = performance.now();
       const assistantStartCount = adapter.assistantCount();
       const ignoredAnswerText = latestAssistantText();
-      const turn = ensureLedgerTurn(prompt.question);
+      const turn = ensureLedgerTurn(prompt.question, { questionImages: draftQuestionImagesRef.current });
+      const questionImages = draftQuestionImagesRef.current.length ? draftQuestionImagesRef.current : turn.questionImages || [];
+      const imagesToAttach = unattachedDraftImages(questionImages);
       activeRequestRef.current = {
         turnId: turn.id,
         question: prompt.question,
@@ -1901,6 +2185,7 @@ function LiveAssistOverlay() {
         (current) => ({
           ...current,
           question: prompt.question,
+          questionImages: mergeImageAttachments(current.questionImages, questionImages),
           status: "starter_waiting",
           requestKind: "starter",
           latency: {
@@ -1918,7 +2203,7 @@ function LiveAssistOverlay() {
       setLatency({ status: "waiting", startedAt, checkpoints: { promptBuildStartedAt } });
       engine.markGeneratingStarter(prompt.question, turn.id);
       setStatusText("Sending starter to ChatGPT...");
-      await adapter.sendPrompt(prompt.prompt, chatGptSendTimings(turn.id));
+      await adapter.sendPrompt(prompt.prompt, chatGptSendTimings(turn.id), { images: imagesToAttach, hasPreattachedImages: questionImages.length > imagesToAttach.length });
       const submittedAt = performance.now();
       updateLedgerTurn(
         turn.id,
@@ -1961,20 +2246,22 @@ function LiveAssistOverlay() {
       appendRollingPasteChunk(pendingText, { skipStarter: true });
     }
 
-    const question = rollingQuestionRef.current.buffer.trim();
+    const question = buildQuestionFromDraft(rollingQuestionRef.current.buffer);
     if (!question) {
       setStatusText("No Dictara chunks captured yet.");
       return;
     }
+    const questionImages = draftQuestionImagesRef.current;
 
     if (typedRole === "interviewer") {
-      const turn = ensureLedgerTurn(question);
+      const turn = ensureLedgerTurn(question, { questionImages });
       engine.finalizeActiveInterviewerQuestion(question, starterMode);
       updateLedgerTurn(
         turn.id,
         (current) => ({
           ...current,
           question,
+          questionImages: mergeImageAttachments(current.questionImages, questionImages),
           status: activeRequestRef.current?.kind === "starter" ? current.status : "draft"
         }),
         { hydrate: false }
@@ -1982,7 +2269,7 @@ function LiveAssistOverlay() {
     } else {
       engine.ingestFinal(typedRole, question, starterMode);
     }
-    setTypedText("");
+    clearDraftInputs();
     setRollingQuestion(createEmptyRollingQuestion());
     rollingQuestionRef.current = createEmptyRollingQuestion();
     lastFlowSubmittedRef.current = "";
@@ -2098,10 +2385,11 @@ function LiveAssistOverlay() {
 
   async function sendToChatGpt() {
     debug("Send clicked");
-    setStatusText("Preparing prompt...");
+    if (!(await waitForPendingImageUploads())) return;
+    setStatusText(`Preparing ${promptKindLabel(responsePromptKind)} prompt...`);
 
     const promptBuildStartedAt = performance.now();
-    const prompt = engine.buildPromptForCurrentQuestion();
+    const prompt = engine.buildPromptForCurrentQuestion(responsePromptKind);
     if (!prompt.ok) {
       setStatusText(prompt.reason);
       debug(`Prompt build failed: ${prompt.reason}`);
@@ -2120,7 +2408,9 @@ function LiveAssistOverlay() {
       const startedAt = performance.now();
       const assistantStartCount = adapter.assistantCount();
       const ignoredAnswerText = latestAssistantText();
-      const turn = ensureLedgerTurn(prompt.question);
+      const questionImages = draftQuestionImagesRef.current;
+      const imagesToAttach = unattachedDraftImages(questionImages);
+      const turn = ensureLedgerTurn(prompt.question, { questionImages });
       activeRequestRef.current = {
         turnId: turn.id,
         question: prompt.question,
@@ -2134,6 +2424,7 @@ function LiveAssistOverlay() {
         (current) => ({
           ...current,
           question: prompt.question,
+          questionImages: mergeImageAttachments(current.questionImages, questionImages),
           status: "final_waiting",
           requestKind: "final",
           latency: {
@@ -2150,7 +2441,7 @@ function LiveAssistOverlay() {
       setElapsedMs(0);
       setLatency({ status: "waiting", startedAt, checkpoints: { promptBuildStartedAt } });
       engine.markGenerating(prompt.question, turn.id);
-      await adapter.sendPrompt(prompt.prompt, chatGptSendTimings(turn.id));
+      await adapter.sendPrompt(prompt.prompt, chatGptSendTimings(turn.id), { images: imagesToAttach, hasPreattachedImages: questionImages.length > imagesToAttach.length });
       const submittedAt = performance.now();
       updateLedgerTurn(
         turn.id,
@@ -2217,10 +2508,14 @@ function LiveAssistOverlay() {
     }
   }
 
-  function resetPromptSettingsDraft(kind: "starter" | "final" | "all") {
+  function resetPromptSettingsDraft(kind: PromptPreviewKind | "all") {
     setDraftPromptSettings((current) => {
       if (kind === "starter") return { ...current, starterPrompt: DEFAULT_PROMPT_SETTINGS.starterPrompt };
-      if (kind === "final") return { ...current, finalPrompt: DEFAULT_PROMPT_SETTINGS.finalPrompt };
+      if (kind === "clarify") return { ...current, clarifyPrompt: DEFAULT_PROMPT_SETTINGS.clarifyPrompt };
+      if (kind === "approach") return { ...current, approachPrompt: DEFAULT_PROMPT_SETTINGS.approachPrompt };
+      if (kind === "code") return { ...current, codePrompt: DEFAULT_PROMPT_SETTINGS.codePrompt };
+      if (kind === "debug") return { ...current, debugPrompt: DEFAULT_PROMPT_SETTINGS.debugPrompt };
+      if (kind === "upgrade") return { ...current, upgradePrompt: DEFAULT_PROMPT_SETTINGS.upgradePrompt };
       return DEFAULT_PROMPT_SETTINGS;
     });
     setPromptSettingsMessage(kind === "all" ? "All prompt drafts reset. Save to apply." : "Prompt draft reset. Save to apply.");
@@ -2228,23 +2523,46 @@ function LiveAssistOverlay() {
   }
 
   function promptPreviewText() {
+    const currentQuestion =
+      state.currentQuestion || rollingQuestion.buffer || "Can you walk me through how you would debug this login issue?";
+    const starter = state.provisionalStarter?.text || "";
+    const candidateSpeech = state.lastCandidateSpeech || "Not captured yet.";
     const values = {
       partialQuestion: rollingQuestion.buffer || state.partialTranscript?.text || "Can you walk me through how you would debug this login issue?",
-      currentQuestion: state.currentQuestion || rollingQuestion.buffer || "Can you walk me through how you would debug this login issue?",
-      starter: state.provisionalStarter?.text || "",
-      candidateSpeech: state.lastCandidateSpeech || "Not captured yet."
+      currentQuestion,
+      starter,
+      candidateSpeech,
+      discussionSoFar: buildDiscussionSoFar(currentQuestion, starter, candidateSpeech),
+      intent: promptKindLabel(promptPreviewKind)
     };
 
-    return compilePromptTemplate(
-      promptPreviewKind === "starter" ? draftPromptSettings.starterPrompt : draftPromptSettings.finalPrompt,
-      values
-    );
+    return compilePromptTemplate(promptTemplateForKind(draftPromptSettings, promptPreviewKind), values);
+  }
+
+  function compileResponsePrompt(question: string, kind: ResponsePromptKind) {
+    const starter = stateRef.current.provisionalStarter?.text;
+    const candidateSpeech = stateRef.current.lastCandidateSpeech;
+    return compilePromptTemplate(promptTemplateForKind(promptSettings, kind), {
+      currentQuestion: question,
+      starter,
+      candidateSpeech,
+      discussionSoFar: buildDiscussionSoFar(question, starter, candidateSpeech),
+      intent: promptKindLabel(kind)
+    });
   }
 
   function footerSubmit() {
+    if (isNativeCaptureActive()) {
+      finalizeNativeQuestion();
+      return;
+    }
+    if (isImageUploadPending()) {
+      setStatusText("Uploading screenshot to ChatGPT. Send will be available when it is ready.");
+      return;
+    }
     const value = typedText.trim();
     if (!value) {
-      setStatusText("Type a question first.");
+      setStatusText(draftQuestionImages.length ? "Screenshot attached. Add text or speech before sending." : "Type a question first.");
       return;
     }
 
@@ -2252,6 +2570,11 @@ function LiveAssistOverlay() {
   }
 
   async function sendManualTextToChatGpt(text: string) {
+    if (isNativeCaptureActive()) {
+      setStatusText("Recording is active. Manual send is disabled during capture.");
+      return;
+    }
+    if (!(await waitForPendingImageUploads())) return;
     const question = text.trim();
     if (!question) return;
 
@@ -2262,13 +2585,17 @@ function LiveAssistOverlay() {
       return;
     }
 
-    const turn = ensureLedgerTurn(question);
+    const questionImages = draftQuestionImagesRef.current;
+    const imagesToAttach = unattachedDraftImages(questionImages);
+    const turn = ensureLedgerTurn(question, { questionImages });
     const promptBuildStartedAt = performance.now();
+    const prompt = compileResponsePrompt(question, responsePromptKind);
     updateLedgerTurn(
       turn.id,
       (current) => ({
         ...current,
         question,
+        questionImages: mergeImageAttachments(current.questionImages, questionImages),
         status: "final_waiting",
         requestKind: "final",
         latency: {
@@ -2295,12 +2622,12 @@ function LiveAssistOverlay() {
         ignoredAnswerText
       };
       firstAnswerNotifiedForRequestRef.current = undefined;
-      setTypedText("");
+      clearDraftInputs();
       setElapsedMs(0);
       setLatency({ status: "waiting", startedAt, checkpoints: { promptBuildStartedAt } });
       engine.markGenerating(question, turn.id);
-      setStatusText("Sending direct message to ChatGPT...");
-      await adapter.sendPrompt(question, chatGptSendTimings(turn.id));
+      setStatusText(`Sending ${promptKindLabel(responsePromptKind)} prompt to ChatGPT...`);
+      await adapter.sendPrompt(prompt, chatGptSendTimings(turn.id), { images: imagesToAttach, hasPreattachedImages: questionImages.length > imagesToAttach.length });
       const submittedAt = performance.now();
       updateLedgerTurn(
         turn.id,
@@ -2345,6 +2672,9 @@ function LiveAssistOverlay() {
     starterPolicyRef.current = { sentCount: 0, maxCount: 1 };
     ledgerTurnsRef.current = [];
     activeLedgerTurnIdRef.current = undefined;
+    latestRawTranscriptRef.current = "";
+    clearTranscriptBaselineRef.current = "";
+    clearDraftInputs();
     void clearStoredChatTurns(conversationIdRef.current);
     void clearTurnLedger(conversationIdRef.current);
     setStatusText("Session cleared");
@@ -2491,19 +2821,38 @@ function LiveAssistOverlay() {
 
       <NextQuestionPanel
         question={liveQuestionText}
+        typedText={typedText}
+        images={draftQuestionImages}
         starter={state.provisionalStarter?.text}
+        intentLabel={promptKindLabel(responsePromptKind)}
         nativeStatus={nativeStatus}
         timeline={captureTimeline}
+        onClear={requestLiveQuestionClear}
+        onRemoveImage={removeDraftQuestionImage}
       />
 
       <footer className="gptd-compose">
         <div className="gptd-compose-inner">
+          <div className="gptd-intent-selector" aria-label="Response intent">
+            {RESPONSE_PROMPT_KINDS.map((intent) => (
+              <button
+                key={intent.kind}
+                type="button"
+                className={responsePromptKind === intent.kind ? "selected" : ""}
+                onClick={() => setResponsePromptKind(intent.kind)}
+                title={intent.description}
+              >
+                {intent.label}
+              </button>
+            ))}
+          </div>
           <textarea
             ref={captureTextareaRef}
             className={isVoiceCapture ? "flow-active" : ""}
             value={captureDisplayValue()}
             rows={1}
             onChange={(event) => handleCaptureTextChange(event.target.value)}
+            onPaste={(event) => void handleCapturePaste(event)}
             onFocus={() => {
               if (isVoiceCapture) debug("Capture input focused");
             }}
@@ -2517,10 +2866,22 @@ function LiveAssistOverlay() {
                 return;
               }
 
-              if (event.key === "Enter" && !event.shiftKey) event.preventDefault();
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                footerSubmit();
+              }
             }}
           />
-          <button className="gptd-send-button" onClick={footerSubmit} disabled={!typedText.trim() || latency.status === "waiting" || latency.status === "streaming"}>
+          <button
+            className="gptd-send-button"
+            onClick={footerSubmit}
+            disabled={
+              isImageUploadPending() ||
+              (!isNativeCaptureActive(nativeStatus) && !typedText.trim() && draftQuestionImages.length === 0) ||
+              latency.status === "waiting" ||
+              latency.status === "streaming"
+            }
+          >
             Send
           </button>
         </div>
@@ -2569,18 +2930,24 @@ function PromptSettingsDrawer({
   message: string;
   warnings: string[];
   liveDocServerUrl: string;
-  previewKind: "starter" | "final";
+  previewKind: PromptPreviewKind;
   previewText: string;
   onDraftChange: React.Dispatch<React.SetStateAction<PromptSettings>>;
   onLiveDocServerUrlChange: (value: string) => void;
   onSaveLiveDocServerUrl: () => void;
-  onPreviewKindChange: (kind: "starter" | "final") => void;
+  onPreviewKindChange: (kind: PromptPreviewKind) => void;
   onSave: () => void;
-  onReset: (kind: "starter" | "final" | "all") => void;
+  onReset: (kind: PromptPreviewKind | "all") => void;
   onClose: () => void;
 }) {
   const validation = validatePromptSettings(draft);
-  const isDirty = draft.starterPrompt !== saved.starterPrompt || draft.finalPrompt !== saved.finalPrompt;
+  const isDirty =
+    draft.starterPrompt !== saved.starterPrompt ||
+    draft.clarifyPrompt !== saved.clarifyPrompt ||
+    draft.approachPrompt !== saved.approachPrompt ||
+    draft.codePrompt !== saved.codePrompt ||
+    draft.debugPrompt !== saved.debugPrompt ||
+    draft.upgradePrompt !== saved.upgradePrompt;
 
   return (
     <aside className="gptd-settings-drawer" aria-label="Prompt settings">
@@ -2619,20 +2986,27 @@ function PromptSettingsDrawer({
           onReset={() => onReset("starter")}
         />
 
-        <PromptEditor
-          title="Final answer prompt"
-          description="Sent once when the full question is finalized."
-          value={draft.finalPrompt}
-          onChange={(value) => onDraftChange((current) => ({ ...current, finalPrompt: value }))}
-          onReset={() => onReset("final")}
-        />
+        {RESPONSE_PROMPT_KINDS.map((prompt) => (
+          <PromptEditor
+            key={prompt.kind}
+            title={`${prompt.label} prompt`}
+            description={prompt.description}
+            value={String(draft[prompt.field])}
+            onChange={(value) => onDraftChange((current) => ({ ...current, [prompt.field]: value }))}
+            onReset={() => onReset(prompt.kind)}
+          />
+        ))}
 
         <section className="gptd-settings-preview">
           <div className="gptd-settings-section-title">
             <strong>Preview</strong>
             <div className="gptd-settings-segment">
               <button className={previewKind === "starter" ? "selected" : ""} onClick={() => onPreviewKindChange("starter")}>Starter</button>
-              <button className={previewKind === "final" ? "selected" : ""} onClick={() => onPreviewKindChange("final")}>Final</button>
+              {RESPONSE_PROMPT_KINDS.map((prompt) => (
+                <button key={prompt.kind} className={previewKind === prompt.kind ? "selected" : ""} onClick={() => onPreviewKindChange(prompt.kind)}>
+                  {prompt.label}
+                </button>
+              ))}
             </div>
           </div>
           <pre>{previewText}</pre>
@@ -2644,6 +3018,8 @@ function PromptSettingsDrawer({
           <code>{"{{currentQuestion}}"}</code>
           <code>{"{{starter}}"}</code>
           <code>{"{{candidateSpeech}}"}</code>
+          <code>{"{{discussionSoFar}}"}</code>
+          <code>{"{{intent}}"}</code>
         </section>
       </div>
 
@@ -2843,6 +3219,57 @@ function buildLiveDocLatency(latency: LatencyState, elapsedMs: number): LiveDocL
   };
 }
 
+async function imageFileToAttachment(file: File, index: number): Promise<ChatGptImageAttachment> {
+  const dataUrl = await readFileAsDataUrl(file);
+  const dimensions = await readImageDimensions(dataUrl);
+  return {
+    src: dataUrl,
+    alt: file.name || `Pasted screenshot ${index + 1}`,
+    width: dimensions.width,
+    height: dimensions.height
+  };
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Unable to read pasted screenshot."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function readImageDimensions(src: string) {
+  return new Promise<{ width?: number; height?: number }>((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth || undefined, height: image.naturalHeight || undefined });
+    image.onerror = () => resolve({});
+    image.src = src;
+  });
+}
+
+function imageFilesFromClipboardData(clipboardData: DataTransfer) {
+  return Array.from(clipboardData.items || [])
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file));
+}
+
+async function readImageFilesFromClipboard() {
+  if (!navigator.clipboard?.read) return [];
+
+  const items = await navigator.clipboard.read();
+  const files: File[] = [];
+  for (const item of items) {
+    const imageType = item.types.find((type) => type.startsWith("image/"));
+    if (!imageType) continue;
+    const blob = await item.getType(imageType);
+    const extension = imageType.split("/")[1] || "png";
+    files.push(new File([blob], `Pasted screenshot.${extension}`, { type: imageType }));
+  }
+  return files;
+}
+
 function liveDocStatusLabel(status: LiveDocPublisherStatus) {
   if (status === "creating") return "creating";
   if (status === "connecting") return "connecting";
@@ -2968,6 +3395,8 @@ function LatencyDetails({ latency }: { latency: LatencyState }) {
     ["Prompt build", checkpoints.promptBuildStartedAt],
     ["Composer start", checkpoints.composerInsertStartedAt],
     ["Composer ready", checkpoints.composerInsertCompletedAt],
+    ["Image attach start", checkpoints.imageAttachStartedAt],
+    ["Image attach ready", checkpoints.imageAttachCompletedAt],
     ["Send click", checkpoints.sendClickedAt],
     ["First answer", latency.firstAnswerAt],
     ["Rendered", latency.lastRenderAt]
@@ -3054,29 +3483,59 @@ function PartialTranscript({ event, starter }: { event: ConversationEvent; start
 
 function NextQuestionPanel({
   question,
+  typedText,
+  images,
   starter,
+  intentLabel,
   nativeStatus,
-  timeline
+  timeline,
+  onClear,
+  onRemoveImage
 }: {
   question: string;
+  typedText: string;
+  images: ChatGptImageAttachment[];
   starter?: string;
+  intentLabel: string;
   nativeStatus: NativeBridgeStatus;
   timeline: CaptureTimelineEntry[];
+  onClear: () => void;
+  onRemoveImage: (src: string) => void;
 }) {
   const displayQuestion = useTypewriterText(question, Boolean(question));
   const isTypingQuestion = displayQuestion.length < question.length;
   const hasQuestion = Boolean(question.trim());
+  const hasTypedText = Boolean(typedText.trim());
+  const hasImages = images.length > 0;
+  const isActive = hasQuestion || hasTypedText || hasImages;
 
   return (
-    <aside className={["gptd-next-question", hasQuestion ? "active" : "", nativeStatus].filter(Boolean).join(" ")}>
+    <aside className={["gptd-next-question", isActive ? "active" : "", nativeStatus].filter(Boolean).join(" ")}>
       <div className="gptd-next-question-header">
         <span>Next question</span>
-        <strong>{hasQuestion ? "capturing" : nativeStatus === "capturing" ? "listening" : nativeStatus}</strong>
+        <div>
+          <em>{intentLabel}</em>
+          <strong>{isActive ? "capturing" : nativeStatus === "capturing" ? "listening" : nativeStatus}</strong>
+          {isActive && (
+            <button type="button" className="gptd-clear-buffer-button" onClick={onClear}>
+              Clear buffer
+            </button>
+          )}
+        </div>
       </div>
       {hasQuestion ? (
         <p>{displayQuestion}{isTypingQuestion && <span className="gptd-type-caret" />}</p>
       ) : (
         <p className="gptd-muted">Live transcript will appear here while the current answer stays readable.</p>
+      )}
+      {hasTypedText && (
+        <div className="gptd-draft-notes">
+          <span>Typed notes</span>
+          <p>{typedText}</p>
+        </div>
+      )}
+      {hasImages && (
+        <DraftImageAttachments images={images} onRemove={onRemoveImage} />
       )}
       {starter && (
         <div className="gptd-starter compact">
@@ -3149,6 +3608,7 @@ function TurnCards({
   viewMode: ReaderViewMode;
 }) {
   const [expandedQuestions, setExpandedQuestions] = useState<Record<string, boolean>>({});
+  const [expandedAnswers, setExpandedAnswers] = useState<Record<string, boolean>>({});
 
   if (turns.length === 0) {
     return <p className="gptd-muted">Waiting for the next question...</p>;
@@ -3167,8 +3627,10 @@ function TurnCards({
             isActive={turn.id === activeTurnId}
             phase={phase}
             viewMode={viewMode}
-            isExpanded={Boolean(expandedQuestions[turn.id])}
-            onToggleExpanded={() => setExpandedQuestions((current) => ({ ...current, [turn.id]: !current[turn.id] }))}
+            isQuestionExpanded={Boolean(expandedQuestions[turn.id])}
+            isAnswerExpanded={Boolean(expandedAnswers[turn.id])}
+            onToggleQuestionExpanded={() => setExpandedQuestions((current) => ({ ...current, [turn.id]: !current[turn.id] }))}
+            onToggleAnswerExpanded={() => setExpandedAnswers((current) => ({ ...current, [turn.id]: !current[turn.id] }))}
           />
         );
       })}
@@ -3183,8 +3645,10 @@ function TurnCard({
   isActive,
   phase,
   viewMode,
-  isExpanded,
-  onToggleExpanded
+  isQuestionExpanded,
+  isAnswerExpanded,
+  onToggleQuestionExpanded,
+  onToggleAnswerExpanded
 }: {
   turn: ConversationTurn;
   index: number;
@@ -3192,8 +3656,10 @@ function TurnCard({
   isActive: boolean;
   phase: string;
   viewMode: ReaderViewMode;
-  isExpanded: boolean;
-  onToggleExpanded: () => void;
+  isQuestionExpanded: boolean;
+  isAnswerExpanded: boolean;
+  onToggleQuestionExpanded: () => void;
+  onToggleAnswerExpanded: () => void;
 }) {
   const isAnswering = isActive && phase === "generating" && !turn.answer;
   const hasLongQuestion = turn.question.length > 260 || Boolean(turn.questionImages?.length) || Boolean(turn.questionFiles?.length);
@@ -3201,6 +3667,10 @@ function TurnCard({
   const displayAnswer = useTypewriterText(turn.answer || "", shouldAnimateAnswer);
   const isTypingAnswer = displayAnswer.length < (turn.answer || "").length;
   const showRichAnswer = Boolean(turn.answerHtml) && !isTypingAnswer;
+  const isHistorical = !isLatest && !isActive;
+  const answerLength = (turn.answerHtml || turn.answer || "").length;
+  const hasLongAnswer = isHistorical && answerLength > 1200;
+  const collapseAnswer = hasLongAnswer && !isAnswerExpanded;
 
   return (
     <article
@@ -3215,14 +3685,14 @@ function TurnCard({
       <div className="gptd-turn-label">Question {index + 1}</div>
       <section className="gptd-question-band">
         <div className="gptd-question-body">
-          <div className={["gptd-question-content", hasLongQuestion && !isExpanded ? "collapsed" : ""].filter(Boolean).join(" ")}>
+          <div className={["gptd-question-content", hasLongQuestion && !isQuestionExpanded ? "collapsed" : ""].filter(Boolean).join(" ")}>
             {turn.question && <p>{turn.question}</p>}
             <ImageAttachments images={turn.questionImages} />
             <FileAttachments files={turn.questionFiles} />
           </div>
           {hasLongQuestion && (
-            <button className="gptd-question-more" type="button" onClick={onToggleExpanded}>
-              {isExpanded ? "Less" : "More"}
+            <button className="gptd-question-more" type="button" onClick={onToggleQuestionExpanded}>
+              {isQuestionExpanded ? "Less" : "More"}
             </button>
           )}
         </div>
@@ -3234,14 +3704,21 @@ function TurnCard({
         </div>
       )}
       {isAnswering && <AnsweringIndicator />}
-      <section className="gptd-answer-band">
-        {showRichAnswer ? (
-          <div className="gptd-rich-answer" dangerouslySetInnerHTML={{ __html: turn.answerHtml || "" }} />
-        ) : (
-          <p>{displayAnswer || (isAnswering ? "" : "Not generated yet.")}{isTypingAnswer && <span className="gptd-type-caret" />}</p>
+      <section className={["gptd-answer-band", collapseAnswer ? "collapsed" : ""].filter(Boolean).join(" ")}>
+        <div className="gptd-answer-content">
+          {showRichAnswer ? (
+            <div className="gptd-rich-answer" dangerouslySetInnerHTML={{ __html: turn.answerHtml || "" }} />
+          ) : (
+            <p>{displayAnswer || (isAnswering ? "" : "Not generated yet.")}{isTypingAnswer && <span className="gptd-type-caret" />}</p>
+          )}
+          {!showRichAnswer && <ImageAttachments images={turn.answerImages} />}
+          <FileAttachments files={turn.answerFiles} />
+        </div>
+        {hasLongAnswer && (
+          <button className="gptd-answer-more" type="button" onClick={onToggleAnswerExpanded}>
+            {isAnswerExpanded ? "Less" : "More"}
+          </button>
         )}
-        {!showRichAnswer && <ImageAttachments images={turn.answerImages} />}
-        <FileAttachments files={turn.answerFiles} />
       </section>
     </article>
   );
@@ -3313,6 +3790,26 @@ function ImageAttachments({ images }: { images?: ChatGptImageAttachment[] }) {
           {image.alt && <figcaption>{image.alt}</figcaption>}
         </figure>
       ))}
+    </div>
+  );
+}
+
+function DraftImageAttachments({ images, onRemove }: { images: ChatGptImageAttachment[]; onRemove: (src: string) => void }) {
+  if (!images.length) return null;
+
+  return (
+    <div className="gptd-draft-images" aria-label="Pasted screenshots">
+      <span>{images.length} screenshot{images.length === 1 ? "" : "s"} attached</span>
+      <div>
+        {images.map((image, index) => (
+          <figure key={`${image.src}-${index}`}>
+            <img src={image.src} alt={image.alt || `Screenshot ${index + 1}`} />
+            <button type="button" onClick={() => onRemove(image.src)} title="Remove screenshot">
+              <X size={12} />
+            </button>
+          </figure>
+        ))}
+      </div>
     </div>
   );
 }

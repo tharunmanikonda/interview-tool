@@ -41,6 +41,7 @@ enum RealtimeControl {
 
 enum RealtimeSessionEnd {
     Finalized(String),
+    Cleared,
     Cancelled,
 }
 
@@ -177,11 +178,6 @@ impl RealtimeRecording {
         let _ = self.control_tx.send(RealtimeControl::Cancel);
     }
 
-    pub fn clear_buffer(&self) {
-        update_latest_transcript(&self.latest_transcript, "");
-        let _ = self.control_tx.send(RealtimeControl::ClearBuffer);
-    }
-
     pub fn snapshot_and_clear(&self) -> String {
         let (response_tx, response_rx) = oneshot::channel();
         if self
@@ -205,6 +201,11 @@ impl RealtimeRecording {
                 self.latest_text()
             }
         }
+    }
+
+    pub fn clear_buffer(&self) {
+        update_latest_transcript(&self.latest_transcript, "");
+        let _ = self.control_tx.send(RealtimeControl::ClearBuffer);
     }
 
     fn latest_text(&self) -> String {
@@ -278,6 +279,14 @@ async fn run_supervised_realtime_session(
                 .await
                 {
                     Ok(RealtimeSessionEnd::Finalized(text)) => return Ok(text),
+                    Ok(RealtimeSessionEnd::Cleared) => {
+                        transcript.clear();
+                        ignored_item_ids_after_flush.clear();
+                        update_latest_transcript(&latest_transcript, "");
+                        live_assist_bridge::realtime_reconnecting(
+                            "Realtime buffer cleared. Starting a fresh transcription session.",
+                        );
+                    }
                     Ok(RealtimeSessionEnd::Cancelled) => return Ok(String::new()),
                     Err(error) => {
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
@@ -469,8 +478,6 @@ async fn run_realtime_session(
                     RealtimeControl::ClearBuffer => {
                         if has_uncommitted_audio {
                             send_json(&mut writer, json!({ "type": "input_audio_buffer.clear" })).await?;
-                            has_uncommitted_audio = false;
-                            pending_sample_count = 0;
                         }
                         if let Some(previous_tx) = pending_flush.take() {
                             let _ = previous_tx.send(String::new());
@@ -478,6 +485,8 @@ async fn run_realtime_session(
                         ignored_item_ids_after_flush.extend(transcript.item_ids());
                         transcript.clear();
                         update_latest_transcript(latest_transcript, "");
+                        let _ = writer.send(Message::Close(None)).await;
+                        return Ok(RealtimeSessionEnd::Cleared);
                     }
                     RealtimeControl::Cancel => {
                         let _ = writer.send(Message::Close(None)).await;

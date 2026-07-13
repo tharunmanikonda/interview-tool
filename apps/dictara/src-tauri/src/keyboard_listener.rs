@@ -345,7 +345,6 @@ impl KeyListener {
 }
 
 const FN_KEYCODE: u32 = 63;
-const SPACE_KEYCODE: u32 = 49;
 const LEFT_CONTROL_KEYCODE: u32 = 59;
 const RIGHT_CONTROL_KEYCODE: u32 = 62;
 const LIVE_ASSIST_FIRST_CHUNK_SECONDS: u64 = 10;
@@ -405,12 +404,6 @@ fn handle_realtime_live_assist_keypress(
     if is_control_key(keycode) && rolling_active.load(Ordering::SeqCst) {
         info!("Live Assist realtime starter requested by Control");
         let _ = command_tx.blocking_send(RecordingCommand::RequestRealtimeStarter);
-        return true;
-    }
-
-    if keycode == SPACE_KEYCODE && rolling_active.load(Ordering::SeqCst) {
-        info!("Live Assist realtime buffer cleared by Space");
-        let _ = command_tx.blocking_send(RecordingCommand::ClearRealtimeBuffer);
         return true;
     }
 

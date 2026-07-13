@@ -16,7 +16,7 @@ pub enum RecordingCommand {
     FinalizeRollingRecording,
     /// In realtime Live Assist mode, emit the current transcript as a final question and keep listening
     FinalizeRealtimeBuffer,
-    /// In realtime Live Assist mode, clear the current transcript buffer and keep listening
+    /// In realtime Live Assist mode, clear the current transcript/audio buffer and keep listening
     ClearRealtimeBuffer,
     /// In realtime Live Assist mode, ask the extension to request a starter for the current buffer
     RequestRealtimeStarter,

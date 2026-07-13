@@ -1,6 +1,8 @@
 import {
   DEFAULT_PROMPT_SETTINGS,
   PromptSettings,
+  ResponsePromptKind,
+  buildDiscussionSoFar,
   compilePromptTemplate
 } from "./promptSettings";
 
@@ -192,18 +194,23 @@ export class LiveAssistEngine {
     this.emit();
   }
 
-  buildPromptForCurrentQuestion(): { ok: true; question: string; prompt: string } | { ok: false; reason: string } {
+  buildPromptForCurrentQuestion(kind: ResponsePromptKind = "general"): { ok: true; question: string; prompt: string } | { ok: false; reason: string } {
     const question = this.state.currentQuestion || this.latestInterviewerQuestion();
     if (!question) {
       return { ok: false, reason: "Add or capture an interviewer question first." };
     }
+    const template = this.promptSettings[responsePromptFieldForKind(kind)];
+    const starter = this.state.provisionalStarter?.text;
+    const candidateSpeech = this.state.lastCandidateSpeech;
     return {
       ok: true,
       question,
-      prompt: compilePromptTemplate(this.promptSettings.finalPrompt, {
+      prompt: compilePromptTemplate(template, {
         currentQuestion: question,
-        starter: this.state.provisionalStarter?.text,
-        candidateSpeech: this.state.lastCandidateSpeech
+        starter,
+        candidateSpeech,
+        discussionSoFar: buildDiscussionSoFar(question, starter, candidateSpeech),
+        intent: kind
       })
     };
   }
@@ -218,7 +225,8 @@ export class LiveAssistEngine {
       ok: true,
       question: trimmed,
       prompt: compilePromptTemplate(this.promptSettings.starterPrompt, {
-        partialQuestion: trimmed
+        partialQuestion: trimmed,
+        intent: "starter"
       })
     };
   }
@@ -531,6 +539,17 @@ function attachmentKey(images?: ConversationImageAttachment[], files?: Conversat
     ...(images?.map((image) => image.src) || []),
     ...(files?.map((file) => file.href || file.name) || [])
   ].join("|");
+}
+
+function responsePromptFieldForKind(
+  kind: ResponsePromptKind
+): "generalPrompt" | "clarifyPrompt" | "approachPrompt" | "codePrompt" | "debugPrompt" | "upgradePrompt" {
+  if (kind === "general") return "generalPrompt";
+  if (kind === "clarify") return "clarifyPrompt";
+  if (kind === "approach") return "approachPrompt";
+  if (kind === "debug") return "debugPrompt";
+  if (kind === "upgrade") return "upgradePrompt";
+  return "generalPrompt";
 }
 
 function normalizeText(text: string) {

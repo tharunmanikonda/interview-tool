@@ -72,6 +72,10 @@ export class NativeBridge {
     return this.send({ type: "finalize_question" });
   }
 
+  clearBuffer() {
+    return this.send({ type: "clear_buffer" });
+  }
+
   cancelQuestion() {
     return this.send({ type: "cancel_question" });
   }

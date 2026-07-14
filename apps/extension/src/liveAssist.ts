@@ -543,11 +543,12 @@ function attachmentKey(images?: ConversationImageAttachment[], files?: Conversat
 
 function responsePromptFieldForKind(
   kind: ResponsePromptKind
-): "generalPrompt" | "clarifyPrompt" | "approachPrompt" | "codePrompt" | "debugPrompt" | "upgradePrompt" {
+): "generalPrompt" | "clarifyPrompt" | "approachPrompt" | "codePrompt" | "debugPrompt" | "debuggingPrompt" | "upgradePrompt" {
   if (kind === "general") return "generalPrompt";
   if (kind === "clarify") return "clarifyPrompt";
   if (kind === "approach") return "approachPrompt";
   if (kind === "debug") return "debugPrompt";
+  if (kind === "debugging") return "debuggingPrompt";
   if (kind === "upgrade") return "upgradePrompt";
   return "generalPrompt";
 }

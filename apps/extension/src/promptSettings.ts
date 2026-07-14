@@ -5,10 +5,11 @@ export type PromptSettings = {
   approachPrompt: string;
   codePrompt: string;
   debugPrompt: string;
+  debuggingPrompt: string;
   upgradePrompt: string;
 };
 
-export type ResponsePromptKind = "general" | "clarify" | "approach" | "code" | "debug" | "upgrade";
+export type ResponsePromptKind = "general" | "clarify" | "approach" | "code" | "debug" | "debugging" | "upgrade";
 export type PromptPreviewKind = "starter" | ResponsePromptKind;
 
 export type PromptTemplateValues = {
@@ -101,6 +102,18 @@ export const DEFAULT_PROMPT_SETTINGS: PromptSettings = {
     "Find the root cause and provide the smallest correct fix.",
     "Keep it concise and interview-ready."
   ].join("\n"),
+  debuggingPrompt: [
+    "Discussion so far:",
+    "{{discussionSoFar}}",
+    "",
+    "Analyze the discussion above and any attached inputs. Continue the debugging workflow using existing and newly provided context.",
+    "",
+    "If ready, give the next step. If a command is needed, include the exact cd path and command.",
+    "",
+    "If more context is needed, tell me exactly what to share next.",
+    "",
+    "Keep it short and interview-ready."
+  ].join("\n"),
   upgradePrompt: [
     "Understand the discussion so far. It contains the upgrade or enhancement request for the current solution/code.",
     "",
@@ -138,6 +151,7 @@ export const RESPONSE_PROMPT_KINDS: Array<{ kind: ResponsePromptKind; label: str
   { kind: "approach", label: "Approach", field: "approachPrompt", description: "Explain assumptions, approaches, and tradeoffs." },
   { kind: "code", label: "Code", field: "codePrompt", description: "Produce the full coding answer." },
   { kind: "debug", label: "Debug", field: "debugPrompt", description: "Find the root cause and smallest correct fix." },
+  { kind: "debugging", label: "Debugging", field: "debuggingPrompt", description: "Continue the screenshot-driven repo debugging workflow." },
   { kind: "upgrade", label: "Upgrade", field: "upgradePrompt", description: "Update the existing solution with the smallest required change." }
 ];
 
@@ -179,7 +193,14 @@ export function validatePromptSettings(settings: PromptSettings): PromptValidati
 
   for (const prompt of RESPONSE_PROMPT_KINDS) {
     const template = settings[prompt.field];
-    if (prompt.kind === "general" || prompt.kind === "approach" || prompt.kind === "code" || prompt.kind === "debug" || prompt.kind === "upgrade") {
+    if (
+      prompt.kind === "general" ||
+      prompt.kind === "approach" ||
+      prompt.kind === "code" ||
+      prompt.kind === "debug" ||
+      prompt.kind === "debugging" ||
+      prompt.kind === "upgrade"
+    ) {
       if (!template.includes("{{discussionSoFar}}")) {
         errors.push(`${prompt.label} prompt must include {{discussionSoFar}}.`);
       }
@@ -212,6 +233,7 @@ export async function loadPromptSettings(): Promise<PromptSettings> {
       approachPrompt: typeof stored.approachPrompt === "string" ? stored.approachPrompt : DEFAULT_PROMPT_SETTINGS.approachPrompt,
       codePrompt: typeof stored.codePrompt === "string" ? stored.codePrompt : DEFAULT_PROMPT_SETTINGS.codePrompt,
       debugPrompt: typeof stored.debugPrompt === "string" ? stored.debugPrompt : DEFAULT_PROMPT_SETTINGS.debugPrompt,
+      debuggingPrompt: typeof stored.debuggingPrompt === "string" ? stored.debuggingPrompt : DEFAULT_PROMPT_SETTINGS.debuggingPrompt,
       upgradePrompt: typeof stored.upgradePrompt === "string" ? stored.upgradePrompt : DEFAULT_PROMPT_SETTINGS.upgradePrompt
     };
 
@@ -237,6 +259,7 @@ async function loadLegacyPromptSettings(): Promise<PromptSettings> {
       approachPrompt: legacyFinal,
       codePrompt: legacyFinal,
       debugPrompt: DEFAULT_PROMPT_SETTINGS.debugPrompt,
+      debuggingPrompt: DEFAULT_PROMPT_SETTINGS.debuggingPrompt,
       upgradePrompt: legacyFinal
     };
     return validatePromptSettings(settings).ok ? settings : DEFAULT_PROMPT_SETTINGS;
@@ -262,6 +285,7 @@ async function loadPreviousPromptSettings(): Promise<PromptSettings | undefined>
       approachPrompt: previousApproach,
       codePrompt: typeof stored.codePrompt === "string" ? stored.codePrompt : DEFAULT_PROMPT_SETTINGS.codePrompt,
       debugPrompt: typeof stored.debugPrompt === "string" ? stored.debugPrompt : DEFAULT_PROMPT_SETTINGS.debugPrompt,
+      debuggingPrompt: typeof stored.debuggingPrompt === "string" ? stored.debuggingPrompt : DEFAULT_PROMPT_SETTINGS.debuggingPrompt,
       upgradePrompt: typeof stored.upgradePrompt === "string" ? stored.upgradePrompt : previousFollowUp
     };
     return validatePromptSettings(settings).ok ? settings : undefined;

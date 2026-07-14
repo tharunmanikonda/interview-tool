@@ -106,6 +106,14 @@ type StarterRequestPolicy = {
 
 type ReaderViewMode = "reader" | "focus";
 type ReaderTheme = "light" | "dark";
+type InterviewType = "coding" | "debugging";
+
+const CODING_RESPONSE_PROMPTS: ResponsePromptKind[] = ["general", "clarify", "approach", "code", "debug", "upgrade"];
+const DEBUGGING_RESPONSE_PROMPTS: ResponsePromptKind[] = ["general", "debugging"];
+const INTERVIEW_TYPE_OPTIONS: Array<{ value: InterviewType; label: string; title: string }> = [
+  { value: "coding", label: "Coding", title: "Coding interview prompts" },
+  { value: "debugging", label: "Debugging", title: "Repo debugging interview prompts" }
+];
 
 type TurnLedgerStatus =
   | "draft"
@@ -858,6 +866,7 @@ function LiveAssistOverlay() {
   const [promptSettingsMessage, setPromptSettingsMessage] = useState("Defaults loaded");
   const [promptSettingsWarnings, setPromptSettingsWarnings] = useState<string[]>([]);
   const [promptPreviewKind, setPromptPreviewKind] = useState<PromptPreviewKind>("starter");
+  const [interviewType, setInterviewType] = useState<InterviewType>("coding");
   const [responsePromptKind, setResponsePromptKind] = useState<ResponsePromptKind>("general");
   const [activeMarkerIndex, setActiveMarkerIndex] = useState(0);
   const [liveDocSession, setLiveDocSession] = useState<StoredLiveDocSession | undefined>();
@@ -903,6 +912,20 @@ function LiveAssistOverlay() {
   const pendingFinalSendRef = useRef(false);
   const [conversationId, setConversationId] = useState(() => getChatConversationId());
   const conversationIdRef = useRef(conversationId);
+  const visibleResponsePrompts = useMemo(() => {
+    const allowed = interviewType === "debugging" ? DEBUGGING_RESPONSE_PROMPTS : CODING_RESPONSE_PROMPTS;
+    return RESPONSE_PROMPT_KINDS.filter((prompt) => allowed.includes(prompt.kind));
+  }, [interviewType]);
+
+  function changeInterviewType(nextType: InterviewType) {
+    const allowed = nextType === "debugging" ? DEBUGGING_RESPONSE_PROMPTS : CODING_RESPONSE_PROMPTS;
+    setInterviewType(nextType);
+    setResponsePromptKind((current) => (allowed.includes(current) ? current : nextType === "debugging" ? "debugging" : "general"));
+    setPromptPreviewKind((current) => {
+      if (current === "starter") return current;
+      return allowed.includes(current) ? current : nextType === "debugging" ? "debugging" : "general";
+    });
+  }
 
   function debug(message: string) {
     const entry = {
@@ -2515,6 +2538,7 @@ function LiveAssistOverlay() {
       if (kind === "approach") return { ...current, approachPrompt: DEFAULT_PROMPT_SETTINGS.approachPrompt };
       if (kind === "code") return { ...current, codePrompt: DEFAULT_PROMPT_SETTINGS.codePrompt };
       if (kind === "debug") return { ...current, debugPrompt: DEFAULT_PROMPT_SETTINGS.debugPrompt };
+      if (kind === "debugging") return { ...current, debuggingPrompt: DEFAULT_PROMPT_SETTINGS.debuggingPrompt };
       if (kind === "upgrade") return { ...current, upgradePrompt: DEFAULT_PROMPT_SETTINGS.upgradePrompt };
       return DEFAULT_PROMPT_SETTINGS;
     });
@@ -2783,6 +2807,20 @@ function LiveAssistOverlay() {
           onChange={setReaderTheme}
         />
 
+        <div className="gptd-interview-selector topbar" aria-label="Interview type">
+          {INTERVIEW_TYPE_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className={interviewType === option.value ? "selected" : ""}
+              onClick={() => changeInterviewType(option.value)}
+              title={option.title}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+
         <LatencyPill latency={latency} elapsedMs={elapsedMs} />
         <LatencyDetails latency={latency} />
         <button className={liveDocSession ? "gptd-top-action active" : "gptd-top-action"} onClick={() => void shareLiveDocSession()} title={liveDocSession?.viewUrl || liveDocMessage}>
@@ -2834,7 +2872,7 @@ function LiveAssistOverlay() {
       <footer className="gptd-compose">
         <div className="gptd-compose-inner">
           <div className="gptd-intent-selector" aria-label="Response intent">
-            {RESPONSE_PROMPT_KINDS.map((intent) => (
+            {visibleResponsePrompts.map((intent) => (
               <button
                 key={intent.kind}
                 type="button"
@@ -2947,6 +2985,7 @@ function PromptSettingsDrawer({
     draft.approachPrompt !== saved.approachPrompt ||
     draft.codePrompt !== saved.codePrompt ||
     draft.debugPrompt !== saved.debugPrompt ||
+    draft.debuggingPrompt !== saved.debuggingPrompt ||
     draft.upgradePrompt !== saved.upgradePrompt;
 
   return (
